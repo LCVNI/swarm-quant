@@ -204,6 +204,90 @@ def calcular_ir_mensal(
 
 
 # ---------------------------------------------------------------------------
+# Métricas e Benchmark
+# ---------------------------------------------------------------------------
+def calcular_metricas_risco(
+    resumo: pd.DataFrame,
+    capital_inicial: float,
+    dias_por_periodo: int,
+    taxa_livre_risco_anual: float = 0.0,
+) -> dict:
+    """A partir da coluna `capital_apos_periodo` de `resumo`, calcula:
+    - retorno_total: (capital_final / capital_inicial) - 1
+    - retorno_anualizado: composto, usando dias_por_periodo * n_periodos
+    - volatilidade_anualizada: desvio padrão dos retornos por período, anualizado
+    - sharpe: (retorno_anualizado - taxa_livre_risco_anual) / volatilidade_anualizada
+    - drawdown_maximo: maior queda percentual do capital acumulado
+    """
+    if resumo.empty:
+        return {
+            "retorno_total": 0.0,
+            "retorno_anualizado": 0.0,
+            "volatilidade_anualizada": 0.0,
+            "sharpe": 0.0,
+            "drawdown_maximo": 0.0,
+        }
+
+    serie = resumo["capital_apos_periodo"]
+    capital_final = serie.iloc[-1]
+    retorno_total = (capital_final / capital_inicial) - 1
+
+    n_periodos = len(serie)
+    dias_totais = n_periodos * dias_por_periodo
+    anos_totais = dias_totais / 252
+
+    if anos_totais > 0:
+        retorno_anualizado = (capital_final / capital_inicial) ** (1 / anos_totais) - 1
+    else:
+        retorno_anualizado = retorno_total
+
+    capital_com_inicial = pd.concat([pd.Series([capital_inicial]), serie])
+    retornos_periodo = capital_com_inicial.pct_change().dropna()
+    periodos_por_ano = 252 / dias_por_periodo
+
+    volatilidade_anualizada = retornos_periodo.std() * (periodos_por_ano ** 0.5)
+    if pd.isna(volatilidade_anualizada) or volatilidade_anualizada == 0:
+        volatilidade_anualizada = 0.0
+        sharpe = 0.0
+    else:
+        sharpe = (retorno_anualizado - taxa_livre_risco_anual) / volatilidade_anualizada
+
+    pico = serie.cummax()
+    drawdown = (serie - pico) / pico
+    drawdown_maximo = drawdown.min()
+
+    return {
+        "retorno_total": float(retorno_total),
+        "retorno_anualizado": float(retorno_anualizado),
+        "volatilidade_anualizada": float(volatilidade_anualizada),
+        "sharpe": float(sharpe),
+        "drawdown_maximo": float(drawdown_maximo),
+    }
+
+
+def calcular_benchmark_equalweight(
+    df_features: pd.DataFrame,
+    datas_decisao: list,
+    horizonte: int,
+) -> pd.DataFrame:
+    """Para cada data de decisão em `datas_decisao`, calcula o retorno
+    médio simples (equal-weight) de `retorno_futuro` entre todos os
+    tickers disponíveis naquela data, como proxy de 'comprar o mercado'.
+    Retorna DataFrame com colunas: data_decisao, retorno_benchmark.
+    """
+    linhas = []
+    for data_decisao in datas_decisao:
+        dt_decisao = pd.Timestamp(data_decisao)
+        candidatos_dia = df_features[df_features["data_pregao"] == dt_decisao]
+        retorno_medio = candidatos_dia["retorno_futuro"].mean() if not candidatos_dia.empty else 0.0
+        linhas.append({
+            "data_decisao": data_decisao,
+            "retorno_benchmark": float(retorno_medio) if pd.notna(retorno_medio) else 0.0
+        })
+    return pd.DataFrame(linhas)
+
+
+# ---------------------------------------------------------------------------
 # Backtest
 # ---------------------------------------------------------------------------
 def backtest_grafo(
@@ -233,7 +317,9 @@ def backtest_grafo(
     base = df_features.dropna(subset=["retorno_1d", "retorno_5d", "retorno_futuro"]).copy()
     datas = np.sort(base["data_pregao"].unique())
     retornos_pivot = _pivot_retornos(df_features)
-    custo_pct_ida_volta = 2 * (taxa_b3 + corretagem_percentual * (1 + iss_pct))
+    
+    custo_fixo_pct_estimado = 2 * corretagem_fixa / capital_max_por_acao if capital_max_por_acao > 0 else 0.0
+    custo_pct_ida_volta_estimado = 2 * (taxa_b3 + corretagem_percentual * (1 + iss_pct)) + custo_fixo_pct_estimado
 
     capital_disponivel = capital_total
     operacoes = []
@@ -257,7 +343,7 @@ def backtest_grafo(
 
         retornos_recentes = candidatos_dia.set_index("ticker")["retorno_5d"]
         sinal = calcular_sinal_grafo(grafo, retornos_recentes)
-        sinal = sinal[sinal["sinal_spillover"] > custo_pct_ida_volta].head(top_n)
+        sinal = sinal[sinal["sinal_spillover"] > custo_pct_ida_volta_estimado].head(top_n)
         if sinal.empty:
             i += horizonte
             continue
@@ -306,4 +392,9 @@ def backtest_grafo(
         })
         i += horizonte
 
-    return pd.DataFrame(operacoes), pd.DataFrame(resumo)
+    df_resumo = pd.DataFrame(resumo)
+    if not df_resumo.empty:
+        df_bench = calcular_benchmark_equalweight(df_features, df_resumo["data_decisao"].tolist(), horizonte)
+        df_resumo = df_resumo.merge(df_bench, on="data_decisao", how="left")
+
+    return pd.DataFrame(operacoes), df_resumo

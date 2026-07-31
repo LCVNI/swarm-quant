@@ -5,7 +5,7 @@ Depende só de grafo_estrategia.py + streamlit/pandas. Não importa core.py.
 """
 import pandas as pd
 import streamlit as st
-
+from pathlib import Path
 import grafo_estrategia as ge
 
 st.set_page_config(page_title="Estratégia de Grafo de Correlação (B3)", layout="wide")
@@ -42,7 +42,7 @@ capital_max_por_acao = col2.number_input("Máximo por ação (R$)", min_value=0.
 horizonte = col3.number_input("Horizonte (pregões à frente)", min_value=1, value=ge.HORIZONTE_PADRAO)
 top_n = col4.number_input("Nº máximo de ativos por período", min_value=1, value=10)
 
-col5, col6 = st.columns(2)
+col5, col6, col7 = st.columns(3)
 janela_correlacao = col5.number_input(
     "Janela de correlação (pregões)", min_value=20, value=ge.JANELA_CORRELACAO_PADRAO, step=10,
     help="Quantos pregões passados usar para calcular a correlação entre as ações.",
@@ -51,6 +51,10 @@ limiar_correlacao = col6.number_input(
     "Correlação mínima para virar 'vizinho' no grafo", min_value=0.0, max_value=1.0,
     value=ge.LIMIAR_CORRELACAO_PADRAO, step=0.05,
     help="Só cria uma aresta entre duas ações se a correlação (em módulo) for maior que isso.",
+)
+taxa_livre_risco = col7.number_input(
+    "Taxa livre de risco anual (%)", min_value=0.0, value=0.0, step=0.5,
+    help="Usada para calcular o Índice Sharpe.",
 )
 
 st.caption(
@@ -95,10 +99,11 @@ with st.expander("Impostos sobre o resultado (IRRF + IR mensal, regra de swing t
 
 if arquivo and st.button("Carregar dados"):
     with st.spinner("Carregando dados e calculando retornos..."):
-        caminho = f"/tmp/{arquivo.name}"
-        with open(caminho, "wb") as f:
+        caminho = Path(arquivo.name)
+
+        with caminho.open("wb") as f:
             f.write(arquivo.getbuffer())
-        df = ge.carregar_dados(caminho)
+        df = ge.carregar_dados(str(caminho))
         df = ge.construir_features_grafo(df, horizonte=int(horizonte))
 
     st.session_state.dados_grafo = dict(
@@ -108,7 +113,7 @@ if arquivo and st.button("Carregar dados"):
         taxa_b3=taxa_b3_pct / 100, corretagem_fixa=corretagem_fixa,
         corretagem_percentual=corretagem_percentual / 100, iss_pct=iss_pct / 100,
         irrf_pct=irrf_pct / 100, ir_aliquota=ir_aliquota_pct / 100,
-        isencao_mensal=isencao_mensal,
+        isencao_mensal=isencao_mensal, taxa_livre_risco=taxa_livre_risco / 100,
     )
     st.success(f"Dados carregados: {len(df):,} linhas, {df['ticker'].nunique()} tickers.")
 
@@ -163,6 +168,13 @@ if "dados_grafo" in st.session_state:
             total_darf = ir_mensal["darf_a_pagar"].sum() if not ir_mensal.empty else 0.0
             capital_final_liquido = capital_final_bruto - total_darf
 
+            metricas_risco = ge.calcular_metricas_risco(
+                resumo, 
+                capital_inicial=capital_inicial, 
+                dias_por_periodo=d["horizonte"], 
+                taxa_livre_risco_anual=d["taxa_livre_risco"]
+            )
+
             m1, m2, m3 = st.columns(3)
             m1.metric("Capital final (antes de IR)", f"R$ {capital_final_bruto:,.2f}",
                       f"{(capital_final_bruto/capital_inicial-1)*100:.2f}%")
@@ -170,10 +182,24 @@ if "dados_grafo" in st.session_state:
             m3.metric("Capital final (líquido de IR)", f"R$ {capital_final_liquido:,.2f}",
                       f"{(capital_final_liquido/capital_inicial-1)*100:.2f}%")
 
+            m4, m5, m6, m7 = st.columns(4)
+            m4.metric("Retorno anualizado", f"{metricas_risco['retorno_anualizado']*100:.2f}%")
+            m5.metric("Volatilidade anual", f"{metricas_risco['volatilidade_anualizada']*100:.2f}%")
+            m6.metric("Sharpe", f"{metricas_risco['sharpe']:.2f}")
+            m7.metric("Drawdown máximo", f"{metricas_risco['drawdown_maximo']*100:.2f}%")
+
             periodos_positivos = float((resumo["lucro_periodo"] > 0).mean())
             st.caption(f"Períodos com lucro operacional positivo: {periodos_positivos:.1%} de {len(resumo)} decisões.")
 
-            st.line_chart(resumo.set_index("data_decisao")["capital_apos_periodo"])
+            grafico_df = pd.DataFrame(index=resumo["data_decisao"])
+            grafico_df["Estratégia"] = (resumo["capital_apos_periodo"].values / capital_inicial) * 100
+            
+            if "retorno_benchmark" in resumo.columns:
+                retornos_bench = resumo["retorno_benchmark"].values
+                acumulado_bench = 100 * (1 + retornos_bench).cumprod()
+                grafico_df["Benchmark (Equal-Weight)"] = acumulado_bench
+
+            st.line_chart(grafico_df)
 
             st.subheader("Resumo por período")
             st.dataframe(resumo, use_container_width=True)
@@ -186,3 +212,22 @@ if "dados_grafo" in st.session_state:
 
             st.subheader("Todas as operações simuladas")
             st.dataframe(operacoes, use_container_width=True)
+
+            st.divider()
+            st.subheader("Extração de Dados")
+            csv_resumo = resumo.to_csv(index=False).encode('utf-8')
+            csv_operacoes = operacoes.to_csv(index=False).encode('utf-8')
+            
+            c_down1, c_down2 = st.columns(2)
+            c_down1.download_button(
+                label="Baixar Resumo do Backtest (CSV)",
+                data=csv_resumo,
+                file_name="backtest_resumo.csv",
+                mime="text/csv",
+            )
+            c_down2.download_button(
+                label="Baixar Operações (CSV)",
+                data=csv_operacoes,
+                file_name="backtest_operacoes.csv",
+                mime="text/csv",
+            )
