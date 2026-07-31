@@ -34,7 +34,11 @@ with st.expander("Metodologia (o que é isso, tecnicamente)"):
         "de 'market graph': limiar de correlação + média ponderada da vizinhança direta."
     )
 
-arquivo = st.file_uploader("Arquivo processado (parquet ou csv, saída do b3_cotahist.py)", type=["parquet", "csv"])
+arquivos = st.file_uploader(
+    "Arquivo(s) processado(s) (parquet ou csv, saída do b3_cotahist.py). "
+    "Pode selecionar vários arquivos (ex.: um por ano) — serão combinados automaticamente.",
+    type=["parquet", "csv"], accept_multiple_files=True,
+)
 
 col1, col2, col3, col4 = st.columns(4)
 capital = col1.number_input("Capital total (R$)", min_value=0.0, value=100000.0, step=1000.0)
@@ -61,6 +65,17 @@ st.caption(
     "Custos e impostos abaixo começam **zerados**. Preencha com os valores da sua corretora "
     "e da sua situação fiscal; o app não assume nenhum valor por conta própria."
 )
+
+with st.expander("Filtro de liquidez"):
+    l1, l2 = st.columns(2)
+    min_negocios_medio = l1.number_input(
+        "Média mínima de negócios por pregão", min_value=0, value=100, step=10,
+        help="Tickers cuja média móvel de número de negócios ficar abaixo disso são excluídos do grafo e do backtest.",
+    )
+    janela_liquidez = l2.number_input(
+        "Janela da média de liquidez (pregões)", min_value=1, value=20, step=5,
+        help="Quantos pregões passados usar para calcular a média móvel de número de negócios.",
+    )
 
 with st.expander("Custos de transação (B3 + corretagem + ISS)"):
     c1, c2, c3 = st.columns(3)
@@ -97,13 +112,26 @@ with st.expander("Impostos sobre o resultado (IRRF + IR mensal, regra de swing t
         step=1000.0, help="Regra oficial (swing trade): R$ 20.000/mês em vendas totais.",
     )
 
-if arquivo and st.button("Carregar dados"):
+if arquivos and st.button("Carregar dados"):
     with st.spinner("Carregando dados e calculando retornos..."):
-        caminho = Path(arquivo.name)
+        frames = []
+        for arquivo in arquivos:
+            caminho = Path(arquivo.name)
+            with caminho.open("wb") as f:
+                f.write(arquivo.getbuffer())
+            frames.append(ge.carregar_dados(str(caminho)))
 
-        with caminho.open("wb") as f:
-            f.write(arquivo.getbuffer())
-        df = ge.carregar_dados(str(caminho))
+        df = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+        # Se os arquivos tiverem datas sobrepostas (ex.: dois exports do mesmo
+        # período), mantém só uma linha por (ticker, data, mercado).
+        df = df.drop_duplicates(subset=["ticker", "data_pregao", "tipo_mercado"], keep="last")
+        df = df.sort_values(["ticker", "data_pregao"])
+
+        n_tickers_antes = df["ticker"].nunique()
+        df = ge.filtrar_liquidez(
+            df, min_negocios_medio=int(min_negocios_medio), janela_liquidez=int(janela_liquidez)
+        )
+        n_tickers_depois = df["ticker"].nunique()
         df = ge.construir_features_grafo(df, horizonte=int(horizonte))
 
     st.session_state.dados_grafo = dict(
@@ -115,7 +143,10 @@ if arquivo and st.button("Carregar dados"):
         irrf_pct=irrf_pct / 100, ir_aliquota=ir_aliquota_pct / 100,
         isencao_mensal=isencao_mensal, taxa_livre_risco=taxa_livre_risco / 100,
     )
-    st.success(f"Dados carregados: {len(df):,} linhas, {df['ticker'].nunique()} tickers.")
+    st.success(
+        f"Dados carregados de {len(arquivos)} arquivo(s): {len(df):,} linhas, "
+        f"{n_tickers_depois} de {n_tickers_antes} tickers mantidos após filtro de liquidez."
+    )
 
 if "dados_grafo" in st.session_state:
     d = st.session_state.dados_grafo

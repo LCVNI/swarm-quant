@@ -54,6 +54,25 @@ def carregar_dados(caminho: str) -> pd.DataFrame:
     return df.sort_values(["ticker", "data_pregao"])
 
 
+def filtrar_liquidez(
+    df: pd.DataFrame,
+    min_negocios_medio: int = 100,
+    janela_liquidez: int = 20,
+) -> pd.DataFrame:
+    """Remove tickers cuja média móvel de `numero_negocios` (janela de
+    `janela_liquidez` pregões) fica abaixo de `min_negocios_medio` na data
+    de referência. Evita que ações pouco líquidas entrem no grafo de
+    correlação (correlações espúrias) e no backtest (preços de fechamento
+    pouco representativos de uma execução real).
+    """
+    df = df.copy()
+    df["media_negocios"] = df.groupby("ticker")["numero_negocios"].transform(
+        lambda s: s.rolling(janela_liquidez, min_periods=1).mean()
+    )
+    df = df[df["media_negocios"] >= min_negocios_medio].copy()
+    return df.drop(columns=["media_negocios"])
+
+
 def construir_features_grafo(df: pd.DataFrame, horizonte: int = HORIZONTE_PADRAO) -> pd.DataFrame:
     """Só o que a estratégia de grafo precisa: retorno_1d (monta o grafo),
     retorno_5d (sinal de curto prazo) e retorno_futuro (realização real)."""

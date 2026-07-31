@@ -10,29 +10,25 @@ o maior retorno por esforço.
 
 ---
 
-## Prioridade 1 — Bloqueadores e rigor mínimo de backtest
+## Prioridade 1 — Bloqueadores e rigor mínimo de backtest ✅ concluída
 
-Sem isso, o projeto não roda de ponta a ponta ou não resiste a uma
-pergunta básica da banca sobre risco.
+Sem isso, o projeto não rodaria de ponta a ponta ou não resistiria a uma
+pergunta básica da banca sobre risco. Todos os itens abaixo já estão
+implementados no código atual.
 
-- [ ] **Adicionar `requests` ao `requirements.txt`** — `b3_cotahist.py`
-  depende dele e o arquivo atual não lista essa dependência; hoje o
-  ambiente só funciona se alguém instalar manualmente.
-- [ ] **Métricas de risco ajustado** — hoje `app_grafo.py` só mostra
-  capital final, DARF total e % de períodos positivos. Adicionar, a
-  partir do `resumo` de `backtest_grafo`:
-  - Retorno acumulado e anualizado
-  - Volatilidade anualizada
-  - Índice de Sharpe (definir taxa livre de risco: CDI é a referência
-    natural no Brasil)
-  - Drawdown máximo
-- [ ] **Comparação com benchmark** — plotar a evolução do capital ao lado
-  do Ibovespa (ou CDI) no mesmo período. Sem isso, não dá para saber se o
-  sinal de spillover gera alfa ou só replica o mercado.
-- [ ] **Corrigir o filtro de custo** em `backtest_grafo` — hoje
-  `sinal_spillover > custo_pct_ida_volta` ignora a corretagem fixa. Incluir
-  o custo fixo estimado (proporcionalizado pelo valor da posição) no
-  filtro, ou documentar explicitamente a limitação na UI.
+- [x] **Adicionar `requests` ao `requirements.txt`** — feito.
+- [x] **Métricas de risco ajustado** — `calcular_metricas_risco` em
+  `grafo_estrategia.py`, exibida em `app_grafo.py`: retorno anualizado,
+  volatilidade anualizada, Sharpe (com taxa livre de risco configurável) e
+  drawdown máximo.
+- [x] **Comparação com benchmark** — `calcular_benchmark_equalweight`
+  (proxy equal-weight do universo de ações), plotado junto com a evolução
+  do capital da estratégia em `app_grafo.py`.
+- [x] **Corrigir o filtro de custo** em `backtest_grafo` — o custo fixo de
+  corretagem agora entra no filtro, proporcionalizado por
+  `capital_max_por_acao`.
+- [x] **Filtro de liquidez** — `filtrar_liquidez` em `grafo_estrategia.py`,
+  exposto em `app_grafo.py` com contagem de tickers mantidos.
 
 ## Prioridade 2 — Robustez estatística
 
@@ -46,10 +42,6 @@ Ataca diretamente o critério "Backtest: rigor e mitigação de vieses".
   contra um baseline aleatório (ex.: comprar top_n ações aleatórias no
   mesmo dia) para checar se a diferença de retorno é estatisticamente
   relevante e não ruído.
-- [ ] **Filtro de liquidez** — excluir ações com baixo volume/número de
-  negócios (`numero_negocios`, `quantidade_negociada`, campos já presentes
-  no COTAHIST) antes de entrar no grafo, para evitar correlações espúrias
-  de papéis pouco líquidos e preços de fechamento não executáveis.
 - [ ] **Sensibilidade de parâmetros** — variar janela de correlação e
   limiar em grade (grid) e mostrar como o resultado muda, para demonstrar
   que a estratégia não foi ajustada (overfit) a uma combinação específica.
@@ -101,8 +93,11 @@ natural de aprofundamento caso o tempo permita, e ajudam no critério
 
 ---
 
-**Resumo de foco para o pré-relatório (31/07/2026):** Prioridade 1 e 2 são
-o que mais move o ponteiro nos critérios de avaliação com menor esforço de
-implementação — Sharpe, drawdown, benchmark e correção do filtro de custo
-dão para fazer reaproveitando a estrutura de `resumo` que já existe em
-`backtest_grafo`, sem reescrever a lógica da estratégia.
+**Resumo de foco para o pré-relatório (31/07/2026):** a Prioridade 1 está
+concluída — Sharpe, drawdown, benchmark, correção do filtro de custo e
+filtro de liquidez já estão implementados e integrados ao `app_grafo.py`.
+O foco agora é rodar o backtest com esses ajustes sobre os dados reais e
+escrever a análise crítica dos resultados. Os itens de Prioridade 2
+(walk-forward, teste de significância, sensibilidade de parâmetros)
+seguem fora do escopo deste pré-relatório, reservados para as fases
+eliminatórias seguintes.

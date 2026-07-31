@@ -22,6 +22,13 @@ Baseada na linha de pesquisa **market graph** (Boginski, Butenko & Pardalos,
 2003/2005), da literatura de econofísica/redes complexas aplicada a
 mercados financeiros.
 
+**Antes de tudo — filtro de liquidez:** ações cuja média móvel de número de
+negócios (janela configurável, padrão 20 pregões) fica abaixo de um mínimo
+(padrão: 100 negócios/pregão) são excluídas do universo antes de qualquer
+cálculo. Isso evita que papéis pouco negociados gerem correlações espúrias
+ou entrem no backtest com preços de fechamento pouco representativos de
+uma execução real.
+
 **Passo a passo, para cada data de decisão:**
 
 1. **Construção do grafo** — calcula a correlação de Pearson
@@ -58,7 +65,8 @@ extensões.
 ├── grafo_estrategia.py  # Lógica da estratégia (grafo, sinal, backtest, IR)
 ├── app_grafo.py         # Interface Streamlit
 ├── requirements.txt     # Dependências Python
-├── config.toml          # Configuração do Streamlit (upload até 1 GB)
+├── .streamlit/
+│   └── config.toml      # Limite de upload do Streamlit (1 GB — ver seção 4)
 └── readme.md            # Este arquivo
 ```
 
@@ -94,10 +102,13 @@ Principais funções:
 | Função | O que faz |
 |---|---|
 | `carregar_dados` | Lê o parquet/csv e filtra só mercado à vista (`tipo_mercado == 10`) |
+| `filtrar_liquidez` | Remove tickers cuja média móvel de número de negócios fica abaixo de um mínimo, evitando correlações espúrias de papéis pouco líquidos |
 | `construir_features_grafo` | Calcula `retorno_1d`, `retorno_5d` e `retorno_futuro` (shift para trás, usado só na realização) |
 | `construir_grafo_correlacao` | Monta o grafo de correlação usando só dados passados |
 | `calcular_sinal_grafo` | Calcula o sinal de spillover por ação |
 | `backtest_grafo` | Loop de simulação completo: decide, aloca, realiza, avança |
+| `calcular_metricas_risco` | Retorno anualizado, volatilidade anualizada, Sharpe e drawdown máximo a partir do `resumo` do backtest |
+| `calcular_benchmark_equalweight` | Retorno médio equal-weight de todos os tickers disponíveis, como proxy de "comprar o mercado" |
 | `calcular_ir_mensal` | Apuração de IR mensal (regra de swing trade, Lei 11.033/2004, Art. 3º, II) |
 
 ### `app_grafo.py` — interface
@@ -112,7 +123,6 @@ corretora e situação fiscal.
 
 ```bash
 pip install -r requirements.txt
-pip install requests   # necessário para b3_cotahist.py — ver seção 6
 
 # 1. Baixar dados (uma vez)
 python b3_cotahist.py --inicio 2018 --fim 2026 --formato parquet
@@ -121,8 +131,10 @@ python b3_cotahist.py --inicio 2018 --fim 2026 --formato parquet
 python -m streamlit run app_grafo.py
 ```
 
-No app: suba o parquet gerado no passo 1 → clique em "Carregar dados" →
-ajuste os parâmetros → clique em "Rodar backtest".
+No app: suba o(s) parquet(s) gerado(s) no passo 1 (pode selecionar vários
+de uma vez — ex.: um por ano, ou o consolidado gerado com `--consolidar`;
+o app combina e remove sobreposições automaticamente) → clique em
+"Carregar dados" → ajuste os parâmetros → clique em "Rodar backtest".
 
 ## 5. Relação com outros documentos do projeto
 
@@ -142,19 +154,22 @@ ajuste os parâmetros → clique em "Rodar backtest".
 
 ## 6. Limitações conhecidas
 
-- `requirements.txt` não lista `requests`, que é usado por
-  `b3_cotahist.py` para baixar os arquivos da B3 — instale manualmente
-  (`pip install requests`) ou adicione ao arquivo.
-- O filtro de custo mínimo (`sinal_spillover > custo_pct_ida_volta`)
-  considera apenas a parte percentual do custo de transação, ignorando a
-  corretagem fixa. Se você configurar corretagem fixa > 0, o filtro pode
-  subestimar o custo real de operações pequenas.
-- Não há filtro de liquidez: ações pouco negociadas podem gerar
-  correlações espúrias e preços de fechamento pouco representativos de uma
-  execução real.
-- O app não calcula métricas de risco ajustado (Sharpe, volatilidade,
-  drawdown máximo) nem compara o resultado com um benchmark (ex.:
-  Ibovespa). Ver `PROXIMOS_PASSOS.md`.
+- O benchmark disponível hoje é uma aproximação **equal-weight** do
+  universo de ações do COTAHIST (após o filtro de liquidez), não o
+  Ibovespa oficial (que é ponderado por valor de mercado free-float). Para
+  o Ibovespa real seria necessário buscar a série `^BVSP` de uma fonte
+  externa, fora do escopo atual por adicionar dependência de rede não
+  solicitada.
+- O backtest ainda não tem validação **walk-forward** automatizada (rodar
+  em múltiplos blocos de tempo e reportar a distribuição de resultados),
+  teste de significância contra um baseline aleatório, nem grade de
+  sensibilidade de parâmetros (janela/limiar de correlação). Esses três
+  itens estão propositalmente fora do escopo do pré-relatório — ver
+  `PROXIMOS_PASSOS.md` e `IMPLEMENTACAO.md`.
+- O drawdown máximo é calculado só sobre a série de
+  `capital_apos_periodo`; se o primeiro período já fechar no negativo,
+  esse prejuízo inicial em relação ao capital inicial não entra no
+  cálculo (nuance de implementação, não um erro).
 
 ## 7. Fontes
 

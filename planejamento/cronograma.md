@@ -3,6 +3,14 @@
 Prazo: pré-relatório entregue até **31/07/2026**. Hoje: **24/07/2026** (7
 dias corridos).
 
+> **Status atualizado:** os itens 1-6 do `IMPLEMENTACAO.md` (correção do
+> `requirements.txt`, filtro de custo, métricas de risco, benchmark
+> equal-weight e filtro de liquidez) já estão concluídos e integrados ao
+> `app_grafo.py`. Os blocos de "Qui 24/07" a "Dom 27/07" abaixo, na parte
+> de implementação técnica, estão portanto feitos — falta rodar o
+> backtest final com esses ajustes e seguir para a análise dos
+> resultados.
+
 ## Decisão de fluxo: relatório ou backtest primeiro?
 
 Nenhum dos dois isoladamente — **paralelizar por tipo de conteúdo**:

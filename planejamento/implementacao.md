@@ -4,6 +4,11 @@ Checklist técnico de implementação, em ordem de execução sugerida. Cada
 item é autocontido (arquivo, função, lógica, critério de aceite) para
 poder ser usado diretamente como instrução para um agente de código.
 
+**Status atual:** itens 1 a 6 (o mínimo para o pré-relatório) estão
+✅ **implementados e validados** no código atual. Itens 7 a 9 seguem
+propositalmente pendentes — são diferenciais de rigor estatístico para as
+fases eliminatórias seguintes, não para o pré-relatório.
+
 Contexto do projeto: `grafo_estrategia.py` contém a lógica pura (sem UI),
 `app_grafo.py` é a interface Streamlit que consome
 `grafo_estrategia.backtest_grafo`. Manter essa separação em todas as
@@ -11,7 +16,7 @@ mudanças abaixo — nenhuma lógica de cálculo deve entrar em `app_grafo.py`.
 
 ---
 
-## 1. Corrigir `requirements.txt`
+## 1. ✅ Corrigir `requirements.txt`
 
 **Arquivo:** `requirements.txt`
 
@@ -34,7 +39,7 @@ requests
 
 ---
 
-## 2. Corrigir filtro de custo em `backtest_grafo`
+## 2. ✅ Corrigir filtro de custo em `backtest_grafo`
 
 **Arquivo:** `grafo_estrategia.py`, função `backtest_grafo`.
 
@@ -78,7 +83,7 @@ os mesmos parâmetros.
 
 ---
 
-## 3. Adicionar métricas de risco ao `backtest_grafo`
+## 3. ✅ Adicionar métricas de risco ao `backtest_grafo`
 
 **Arquivo:** `grafo_estrategia.py`.
 
@@ -134,7 +139,7 @@ manual (planilha ou script de verificação separado).
 
 ---
 
-## 4. Adicionar comparação com benchmark (Ibovespa)
+## 4. ✅ Adicionar comparação com benchmark (Ibovespa)
 
 **Arquivo:** `grafo_estrategia.py`.
 
@@ -177,7 +182,7 @@ existentes.
 
 ---
 
-## 5. Expor as novas métricas no `app_grafo.py`
+## 5. ✅ Expor as novas métricas no `app_grafo.py`
 
 **Arquivo:** `app_grafo.py`.
 
@@ -202,12 +207,13 @@ runtime.
 
 ---
 
-## 6. Filtro de liquidez
+## 6. ✅ Filtro de liquidez
 
-**Arquivo:** `grafo_estrategia.py`, função `carregar_dados` (ou nova
-função `filtrar_liquidez` chamada antes de `construir_features_grafo`).
+**Arquivo:** `grafo_estrategia.py`, nova função `filtrar_liquidez`,
+chamada em `app_grafo.py` logo após `ge.carregar_dados` e antes de
+`ge.construir_features_grafo`.
 
-**Ação:**
+**Implementado:**
 ```python
 def filtrar_liquidez(
     df: pd.DataFrame,
@@ -216,22 +222,23 @@ def filtrar_liquidez(
 ) -> pd.DataFrame:
     """Remove tickers cuja média móvel de `numero_negocios` (janela de
     `janela_liquidez` pregões) fica abaixo de `min_negocios_medio` na
-    data de referência. Calculado por ticker, usando
-    df.groupby('ticker')['numero_negocios'].transform(
+    data de referência."""
+    df = df.copy()
+    df["media_negocios"] = df.groupby("ticker")["numero_negocios"].transform(
         lambda s: s.rolling(janela_liquidez, min_periods=1).mean()
     )
-    Mantém apenas linhas onde essa média >= min_negocios_medio.
-    """
+    df = df[df["media_negocios"] >= min_negocios_medio].copy()
+    return df.drop(columns=["media_negocios"])
 ```
 
-**Integração:** chamar `filtrar_liquidez` dentro do fluxo de
-`app_grafo.py`, logo após `ge.carregar_dados`, com os dois parâmetros
-expostos como `st.number_input` (defaults: 100 negócios médios, janela de
-20 pregões).
+**Integração:** em `app_grafo.py`, os dois parâmetros (`min_negocios_medio`,
+`janela_liquidez`) estão expostos num expander "Filtro de liquidez"
+(defaults: 100 negócios médios, janela de 20 pregões), aplicados logo após
+o upload e antes do cálculo de features.
 
-**Critério de aceite:** o número de tickers distintos após o filtro deve
-ser menor ou igual ao original; exibir essa contagem na UI (ex.: "X de Y
-tickers mantidos após filtro de liquidez").
+**Critério de aceite:** ✅ atendido — a mensagem de sucesso após "Carregar
+dados" mostra "X de Y tickers mantidos após filtro de liquidez", com X ≤
+Y por construção do filtro.
 
 ---
 
@@ -346,6 +353,7 @@ com valores distintos entre si.
 1 → 2 → 3 → 5 (parcial, só métricas de risco) → 4 → 5 (completar com
 benchmark) → 6 → 7 → 8 → 9.
 
-Itens 1-6 são o mínimo para o pré-relatório. Itens 7-9 são diferenciais
-de rigor metodológico, mais relevantes para as fases eliminatórias
-seguintes (quartas de final em diante).
+Itens 1-6 são o mínimo para o pré-relatório e **já estão concluídos**.
+Itens 7-9 seguem pendentes de propósito — são diferenciais de rigor
+metodológico mais relevantes para as fases eliminatórias seguintes
+(quartas de final em diante).
