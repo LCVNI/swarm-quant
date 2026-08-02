@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from datetime import date
 from pathlib import Path
 
@@ -81,16 +82,66 @@ def _baixar_serie_bcb_em_blocos(codigo: int, data_inicio: str, data_fim: str, an
     return pd.concat(blocos, ignore_index=True).drop_duplicates(subset="data").sort_values("data")
 
 
-def baixar_ibovespa(data_inicio: str, data_fim: str) -> pd.DataFrame:
+def _escolher_range_brapi(data_inicio: str, data_fim: str) -> str:
+    """A brapi.dev usa períodos pré-definidos (range), não datas soltas no
+    endpoint /api/quote. Escolhe o menor bucket que cobre o intervalo
+    pedido; o filtro fino pelas datas exatas é feito depois, em pandas."""
+    dias = (pd.Timestamp(data_fim) - pd.Timestamp(data_inicio)).days
+    anos = dias / 365
+    if anos <= 1:
+        return "1y"
+    if anos <= 2:
+        return "2y"
+    if anos <= 5:
+        return "5y"
+    if anos <= 10:
+        return "10y"
+    return "max"
+
+
+def baixar_ibovespa_brapi(data_inicio: str, data_fim: str, token: str) -> pd.DataFrame:
+    """Baixa o fechamento diário do Ibovespa via brapi.dev (API brasileira
+    dedicada a dados da B3 — ações, FIIs, BDRs e índices — com SLA e
+    documentação em PT-BR; alternativa mais estável ao Yahoo Finance,
+    mas exige token gratuito: cadastro em https://brapi.dev/dashboard).
+
+    NÃO TESTADO contra a API real neste ambiente (sandbox sem acesso a
+    brapi.dev) — a implementação segue a documentação pública
+    (https://brapi.dev/docs/acoes), mas vale validar localmente antes de
+    confiar no resultado, sobretudo o formato exato da resposta JSON.
+    """
+    range_str = _escolher_range_brapi(data_inicio, data_fim)
+    url = "https://brapi.dev/api/quote/%5EBVSP"  # ^BVSP url-encoded
+    params = {"range": range_str, "interval": "1d", "token": token}
+
+    resposta = requests.get(url, params=params, timeout=30)
+    resposta.raise_for_status()
+    payload = resposta.json()
+
+    resultados = payload.get("results") or []
+    if not resultados or "historicalDataPrice" not in resultados[0]:
+        raise RuntimeError(
+            "Resposta da brapi.dev sem 'historicalDataPrice' — verifique o "
+            "token, o plano da conta, ou se o formato da resposta mudou."
+        )
+
+    hist = pd.DataFrame(resultados[0]["historicalDataPrice"])
+    hist["data"] = pd.to_datetime(hist["date"], unit="s")
+    hist = hist.rename(columns={"close": "ibovespa_fechamento"})[["data", "ibovespa_fechamento"]]
+    hist = hist[(hist["data"] >= pd.Timestamp(data_inicio)) & (hist["data"] <= pd.Timestamp(data_fim))]
+    return hist.sort_values("data").reset_index(drop=True)
+
+
+def baixar_ibovespa_yfinance(data_inicio: str, data_fim: str) -> pd.DataFrame:
     """Baixa o fechamento diário do Ibovespa (ticker ^BVSP) via yfinance.
     Retorna DataFrame com colunas: data, ibovespa_fechamento.
 
-    Não é uma fonte oficial da B3. Se preferir a série oficial, baixe
+    Não é uma fonte oficial da B3, nem a mais estável (Yahoo Finance não
+    tem SLA para uso programático). Se preferir a série oficial, baixe
     manualmente em:
     b3.com.br/pt_br/market-data-e-indices/indices/indices-amplos/
     indice-ibovespa-ibovespa-estatisticas-historicas.htm
-    e adapte esta função para ler o arquivo baixado em vez de chamar o
-    yfinance.
+    e adapte esta função para ler o arquivo baixado.
     """
     import yfinance as yf
 
@@ -109,17 +160,65 @@ def baixar_ibovespa(data_inicio: str, data_fim: str) -> pd.DataFrame:
     return dados
 
 
-def montar_benchmarks(data_inicio: str, data_fim: str) -> pd.DataFrame:
-    logging.info("Baixando Selic (SGS %d)...", CODIGO_SELIC)
-    selic = _baixar_serie_bcb_em_blocos(CODIGO_SELIC, data_inicio, data_fim).rename(columns={"valor": "selic_diaria"})
+def baixar_ibovespa(data_inicio: str, data_fim: str, brapi_token: str | None = None) -> pd.DataFrame:
+    """Baixa o fechamento diário do Ibovespa. Tenta brapi.dev primeiro se
+    houver um token disponível (parâmetro `brapi_token` ou variável de
+    ambiente BRAPI_TOKEN) — API brasileira dedicada, mais estável. Se não
+    houver token, ou a chamada falhar, cai para yfinance (sem cadastro,
+    porém sem SLA)."""
+    token = brapi_token or os.environ.get("BRAPI_TOKEN")
+    if token:
+        try:
+            return baixar_ibovespa_brapi(data_inicio, data_fim, token)
+        except Exception as exc:
+            logging.warning("Falha ao baixar Ibovespa via brapi.dev, tentando yfinance: %s", exc)
+    return baixar_ibovespa_yfinance(data_inicio, data_fim)
 
-    logging.info("Baixando CDI (SGS %d)...", CODIGO_CDI)
-    cdi = _baixar_serie_bcb_em_blocos(CODIGO_CDI, data_inicio, data_fim).rename(columns={"valor": "cdi_diario"})
 
-    logging.info("Baixando Ibovespa (yfinance, ^BVSP)...")
-    ibov = baixar_ibovespa(data_inicio, data_fim)
+def montar_benchmarks(data_inicio: str, data_fim: str, brapi_token: str | None = None) -> pd.DataFrame:
+    """Baixa Selic, CDI e Ibovespa. Se uma das três fontes falhar (o
+    Ibovespa é historicamente a mais instável das três, sobretudo via
+    yfinance), NÃO descarta as outras — retorna o que conseguiu baixar,
+    com aviso no log. Só levanta exceção se as três falharem.
 
-    df = selic.merge(cdi, on="data", how="outer").merge(ibov, on="data", how="outer")
+    `brapi_token`: se informado (ou via variável de ambiente
+    BRAPI_TOKEN), o Ibovespa é buscado via brapi.dev em vez de yfinance —
+    ver `baixar_ibovespa`.
+    """
+    partes = []
+
+    try:
+        logging.info("Baixando Selic (SGS %d)...", CODIGO_SELIC)
+        selic = _baixar_serie_bcb_em_blocos(CODIGO_SELIC, data_inicio, data_fim).rename(columns={"valor": "selic_diaria"})
+        if not selic.empty:
+            partes.append(selic)
+    except Exception as exc:
+        logging.warning("Falha ao baixar Selic, seguindo sem ela: %s", exc)
+
+    try:
+        logging.info("Baixando CDI (SGS %d)...", CODIGO_CDI)
+        cdi = _baixar_serie_bcb_em_blocos(CODIGO_CDI, data_inicio, data_fim).rename(columns={"valor": "cdi_diario"})
+        if not cdi.empty:
+            partes.append(cdi)
+    except Exception as exc:
+        logging.warning("Falha ao baixar CDI, seguindo sem ele: %s", exc)
+
+    try:
+        logging.info("Baixando Ibovespa...")
+        ibov = baixar_ibovespa(data_inicio, data_fim, brapi_token=brapi_token)
+        if not ibov.empty:
+            partes.append(ibov)
+    except Exception as exc:
+        logging.warning("Falha ao baixar Ibovespa, seguindo sem ele: %s", exc)
+
+    if not partes:
+        raise RuntimeError(
+            "Não foi possível baixar nenhum dos três benchmarks (Selic, CDI, Ibovespa)."
+        )
+
+    df = partes[0]
+    for parte in partes[1:]:
+        df = df.merge(parte, on="data", how="outer")
     return df.sort_values("data").reset_index(drop=True)
 
 
@@ -129,6 +228,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fim", default=str(date.today()), help="Data final, formato YYYY-MM-DD.")
     parser.add_argument("--formato", choices=["parquet", "csv"], default="parquet")
     parser.add_argument("--saida", type=Path, default=Path("dados_b3/benchmarks_externos"))
+    parser.add_argument(
+        "--brapi-token", default=None,
+        help="Token gratuito da brapi.dev (brapi.dev/dashboard) para buscar o Ibovespa por lá em vez do yfinance. "
+             "Também pode ser definido via variável de ambiente BRAPI_TOKEN.",
+    )
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
     return parser.parse_args()
 
@@ -140,7 +244,7 @@ def main() -> int:
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
 
-    df = montar_benchmarks(args.inicio, args.fim)
+    df = montar_benchmarks(args.inicio, args.fim, brapi_token=args.brapi_token)
 
     args.saida.parent.mkdir(parents=True, exist_ok=True)
     ext = "parquet" if args.formato == "parquet" else "csv"

@@ -96,7 +96,13 @@ def construir_grafo_correlacao(
     janela: int = JANELA_CORRELACAO_PADRAO,
     limiar_correlacao: float = LIMIAR_CORRELACAO_PADRAO,
 ) -> nx.Graph:
-    """Grafo de correlação usando só dados ANTERIORES a `data_referencia` (sem vazamento)."""
+    """Grafo de correlação usando só dados ANTERIORES a `data_referencia` (sem vazamento).
+
+    Extração de arestas vetorizada com numpy (só a triangular superior da
+    matriz de correlação, sem diagonal) em vez de um loop duplo em Python
+    puro sobre todos os pares de tickers — mesmo grafo, mesmos pesos,
+    mesmo critério de corte, só mais rápido para universos grandes.
+    """
     janela_dados = retornos_pivot[retornos_pivot.index < data_referencia].tail(janela)
     grafo = nx.Graph()
     if len(janela_dados) < max(20, janela // 3):
@@ -104,12 +110,20 @@ def construir_grafo_correlacao(
 
     corr = janela_dados.corr(min_periods=max(20, janela // 3))
     grafo.add_nodes_from(corr.columns)
-    colunas = list(corr.columns)
-    for i, t1 in enumerate(colunas):
-        for t2 in colunas[i + 1:]:
-            peso = corr.loc[t1, t2]
-            if pd.notna(peso) and abs(peso) >= limiar_correlacao:
-                grafo.add_edge(t1, t2, weight=float(peso))
+
+    colunas = corr.columns.to_numpy()
+    valores = corr.to_numpy()
+    n = len(colunas)
+    if n < 2:
+        return grafo
+
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    pesos = valores[i_idx, j_idx]
+    mascara = np.isfinite(pesos) & (np.abs(pesos) >= limiar_correlacao)
+
+    for i, j, peso in zip(i_idx[mascara], j_idx[mascara], pesos[mascara]):
+        grafo.add_edge(colunas[i], colunas[j], weight=float(peso))
+
     return grafo
 
 
@@ -464,12 +478,17 @@ def backtest_grafo(
                 "lucro": round(lucro, 2),
             })
 
+        capital_alocado = float(selecionados["valor_alocado"].sum()) if not selecionados.empty else 0.0
+        pct_capital_alocado = capital_alocado / capital_disponivel if capital_disponivel > 0 else 0.0
+
         capital_disponivel += lucro_periodo
         resumo.append({
             "data_decisao": pd.Timestamp(data_decisao).date(),
             "data_venda_prevista": data_venda.date() if pd.notna(data_venda) else None,
             "n_operacoes": len(selecionados),
             "n_arestas_grafo": grafo.number_of_edges(),
+            "capital_alocado": round(capital_alocado, 2),
+            "pct_capital_alocado": round(pct_capital_alocado, 4),
             "lucro_periodo": round(lucro_periodo, 2),
             "capital_apos_periodo": round(capital_disponivel, 2),
         })

@@ -16,12 +16,13 @@ except ImportError:
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def _buscar_benchmarks_automaticamente(data_inicio: str, data_fim: str) -> pd.DataFrame:
-    """Busca Selic, CDI (BCB) e Ibovespa (yfinance) para o intervalo dado.
-    Cacheado por 1h e por (data_inicio, data_fim) — não bate na API de novo
-    a cada clique em 'Rodar backtest', só quando o intervalo de dados muda.
+def _buscar_benchmarks_automaticamente(data_inicio: str, data_fim: str, brapi_token: str = "") -> pd.DataFrame:
+    """Busca Selic, CDI (BCB) e Ibovespa (brapi.dev com token, ou yfinance
+    sem token) para o intervalo dado. Cacheado por 1h e por
+    (data_inicio, data_fim, token) — não bate na API de novo a cada clique
+    em 'Rodar backtest', só quando o intervalo de dados muda.
     """
-    return bx.montar_benchmarks(data_inicio, data_fim)
+    return bx.montar_benchmarks(data_inicio, data_fim, brapi_token=brapi_token or None)
 
 st.set_page_config(page_title="Estratégia de Grafo de Correlação (B3)", layout="wide")
 st.title("Estratégia B3 baseada em grafo de correlação")
@@ -70,11 +71,19 @@ if not BENCHMARKS_AUTOMATICOS_DISPONIVEL:
     )
 elif modo_benchmarks == "Buscar automaticamente (Selic/CDI/Ibovespa)":
     st.caption(
-        "Busca Selic e CDI na API do Banco Central e o Ibovespa via Yahoo Finance "
-        "(^BVSP, fonte não oficial da B3) no intervalo de datas dos dados carregados. "
-        "Requer `pip install yfinance` e internet no momento de clicar em 'Carregar dados'. "
-        "Se a busca falhar (sem internet, API fora do ar), use a opção de upload manual."
+        "Busca Selic e CDI na API do Banco Central. Para o Ibovespa, use um "
+        "token gratuito da brapi.dev (cadastro em brapi.dev/dashboard) — mais "
+        "estável, com SLA e suporte em PT-BR. Sem token, cai para o Yahoo "
+        "Finance (^BVSP), que não tem garantia de estabilidade para uso "
+        "programático. Requer internet no momento de clicar em 'Carregar dados'; "
+        "se a busca falhar, use a opção de upload manual."
     )
+    brapi_token = st.text_input(
+        "Token da brapi.dev (opcional, para o Ibovespa)", type="password",
+        help="Gratuito — crie em https://brapi.dev/dashboard. Deixe em branco para usar Yahoo Finance.",
+    )
+else:
+    brapi_token = ""
 
 arquivo_benchmarks = None
 if modo_benchmarks == "Subir arquivo (benchmarks_externos.py)":
@@ -183,7 +192,7 @@ if arquivos and st.button("Carregar dados"):
             try:
                 data_ini_str = df["data_pregao"].min().strftime("%Y-%m-%d")
                 data_fim_str = df["data_pregao"].max().strftime("%Y-%m-%d")
-                df_benchmarks = _buscar_benchmarks_automaticamente(data_ini_str, data_fim_str)
+                df_benchmarks = _buscar_benchmarks_automaticamente(data_ini_str, data_fim_str, brapi_token)
             except Exception as exc:
                 erro_benchmarks = str(exc)
         elif modo_benchmarks == "Subir arquivo (benchmarks_externos.py)" and arquivo_benchmarks is not None:
@@ -207,11 +216,24 @@ if arquivos and st.button("Carregar dados"):
     )
     if erro_benchmarks:
         st.warning(
-            f"Não foi possível buscar Selic/CDI/Ibovespa automaticamente ({erro_benchmarks}). "
+            f"Não foi possível buscar nenhum benchmark externo automaticamente ({erro_benchmarks}). "
             "O backtest segue normalmente com o benchmark equal-weight; gere o arquivo com "
             "`benchmarks_externos.py` e suba manualmente se quiser tentar de novo."
         )
-    msg_bench = " + benchmarks externos (Selic/CDI/Ibovespa)" if df_benchmarks is not None else ""
+    msg_bench = ""
+    if df_benchmarks is not None:
+        obtidos = []
+        if "selic_diaria" in df_benchmarks.columns and df_benchmarks["selic_diaria"].notna().any():
+            obtidos.append("Selic")
+        if "cdi_diario" in df_benchmarks.columns and df_benchmarks["cdi_diario"].notna().any():
+            obtidos.append("CDI")
+        if "ibovespa_fechamento" in df_benchmarks.columns and df_benchmarks["ibovespa_fechamento"].notna().any():
+            obtidos.append("Ibovespa")
+        if obtidos:
+            msg_bench = f" + benchmarks externos ({', '.join(obtidos)})"
+        faltando = {"Selic", "CDI", "Ibovespa"} - set(obtidos)
+        if faltando:
+            st.warning(f"Não foi possível obter: {', '.join(sorted(faltando))}. Os demais benchmarks disponíveis seguem normalmente.")
     st.success(
         f"Dados carregados de {len(arquivos)} arquivo(s){msg_bench}: {len(df):,} linhas, "
         f"{n_tickers_depois} de {n_tickers_antes} tickers mantidos após filtro de liquidez."
@@ -292,6 +314,17 @@ if "dados_grafo" in st.session_state:
 
             periodos_positivos = float((resumo["lucro_periodo"] > 0).mean())
             st.caption(f"Períodos com lucro operacional positivo: {periodos_positivos:.1%} de {len(resumo)} decisões.")
+
+            if "pct_capital_alocado" in resumo.columns:
+                pct_medio_alocado = float(resumo["pct_capital_alocado"].mean())
+                st.caption(
+                    f"Capital efetivamente alocado: em média {pct_medio_alocado:.1%} do capital "
+                    "disponível por período. Se esse número estiver bem abaixo de 100%, a "
+                    "estratégia está deixando capital ocioso — a comparação com o benchmark "
+                    "equal-weight (que assume 100% investido) fica menos justa. Considere "
+                    "aumentar 'Máximo por ação' e/ou 'Nº máximo de ativos por período' para "
+                    "que top_n × máximo por ação se aproxime do capital total."
+                )
 
             grafico_df = pd.DataFrame(index=resumo["data_decisao"])
             grafico_df["Estratégia"] = (resumo["capital_apos_periodo"].values / capital_inicial) * 100
