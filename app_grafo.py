@@ -8,6 +8,21 @@ import streamlit as st
 from pathlib import Path
 import grafo_estrategia as ge
 
+try:
+    import benchmarks_externos as bx
+    BENCHMARKS_AUTOMATICOS_DISPONIVEL = True
+except ImportError:
+    BENCHMARKS_AUTOMATICOS_DISPONIVEL = False
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _buscar_benchmarks_automaticamente(data_inicio: str, data_fim: str) -> pd.DataFrame:
+    """Busca Selic, CDI (BCB) e Ibovespa (yfinance) para o intervalo dado.
+    Cacheado por 1h e por (data_inicio, data_fim) — não bate na API de novo
+    a cada clique em 'Rodar backtest', só quando o intervalo de dados muda.
+    """
+    return bx.montar_benchmarks(data_inicio, data_fim)
+
 st.set_page_config(page_title="Estratégia de Grafo de Correlação (B3)", layout="wide")
 st.title("Estratégia B3 baseada em grafo de correlação")
 
@@ -39,6 +54,34 @@ arquivos = st.file_uploader(
     "Pode selecionar vários arquivos (ex.: um por ano) — serão combinados automaticamente.",
     type=["parquet", "csv"], accept_multiple_files=True,
 )
+
+opcoes_benchmarks = ["Não usar", "Subir arquivo (benchmarks_externos.py)"]
+if BENCHMARKS_AUTOMATICOS_DISPONIVEL:
+    opcoes_benchmarks.insert(1, "Buscar automaticamente (Selic/CDI/Ibovespa)")
+
+modo_benchmarks = st.radio(
+    "Benchmarks externos (Selic, CDI, Ibovespa) — além do equal-weight, sempre calculado",
+    opcoes_benchmarks, horizontal=True,
+)
+if not BENCHMARKS_AUTOMATICOS_DISPONIVEL:
+    st.caption(
+        "Busca automática indisponível (arquivo `benchmarks_externos.py` não encontrado "
+        "na mesma pasta do app). Você ainda pode gerar o arquivo separadamente e subir manualmente."
+    )
+elif modo_benchmarks == "Buscar automaticamente (Selic/CDI/Ibovespa)":
+    st.caption(
+        "Busca Selic e CDI na API do Banco Central e o Ibovespa via Yahoo Finance "
+        "(^BVSP, fonte não oficial da B3) no intervalo de datas dos dados carregados. "
+        "Requer `pip install yfinance` e internet no momento de clicar em 'Carregar dados'. "
+        "Se a busca falhar (sem internet, API fora do ar), use a opção de upload manual."
+    )
+
+arquivo_benchmarks = None
+if modo_benchmarks == "Subir arquivo (benchmarks_externos.py)":
+    arquivo_benchmarks = st.file_uploader(
+        "Arquivo de benchmarks (parquet/csv, saída do benchmarks_externos.py)",
+        type=["parquet", "csv"],
+    )
 
 col1, col2, col3, col4 = st.columns(4)
 capital = col1.number_input("Capital total (R$)", min_value=0.0, value=100000.0, step=1000.0)
@@ -134,6 +177,24 @@ if arquivos and st.button("Carregar dados"):
         n_tickers_depois = df["ticker"].nunique()
         df = ge.construir_features_grafo(df, horizonte=int(horizonte))
 
+        df_benchmarks = None
+        erro_benchmarks = None
+        if modo_benchmarks == "Buscar automaticamente (Selic/CDI/Ibovespa)":
+            try:
+                data_ini_str = df["data_pregao"].min().strftime("%Y-%m-%d")
+                data_fim_str = df["data_pregao"].max().strftime("%Y-%m-%d")
+                df_benchmarks = _buscar_benchmarks_automaticamente(data_ini_str, data_fim_str)
+            except Exception as exc:
+                erro_benchmarks = str(exc)
+        elif modo_benchmarks == "Subir arquivo (benchmarks_externos.py)" and arquivo_benchmarks is not None:
+            caminho_bench = Path(arquivo_benchmarks.name)
+            with caminho_bench.open("wb") as f:
+                f.write(arquivo_benchmarks.getbuffer())
+            df_benchmarks = (
+                pd.read_parquet(caminho_bench) if caminho_bench.suffix == ".parquet"
+                else pd.read_csv(caminho_bench, parse_dates=["data"])
+            )
+
     st.session_state.dados_grafo = dict(
         df=df, capital=capital, capital_max_por_acao=capital_max_por_acao,
         horizonte=int(horizonte), top_n=int(top_n),
@@ -142,9 +203,17 @@ if arquivos and st.button("Carregar dados"):
         corretagem_percentual=corretagem_percentual / 100, iss_pct=iss_pct / 100,
         irrf_pct=irrf_pct / 100, ir_aliquota=ir_aliquota_pct / 100,
         isencao_mensal=isencao_mensal, taxa_livre_risco=taxa_livre_risco / 100,
+        df_benchmarks=df_benchmarks,
     )
+    if erro_benchmarks:
+        st.warning(
+            f"Não foi possível buscar Selic/CDI/Ibovespa automaticamente ({erro_benchmarks}). "
+            "O backtest segue normalmente com o benchmark equal-weight; gere o arquivo com "
+            "`benchmarks_externos.py` e suba manualmente se quiser tentar de novo."
+        )
+    msg_bench = " + benchmarks externos (Selic/CDI/Ibovespa)" if df_benchmarks is not None else ""
     st.success(
-        f"Dados carregados de {len(arquivos)} arquivo(s): {len(df):,} linhas, "
+        f"Dados carregados de {len(arquivos)} arquivo(s){msg_bench}: {len(df):,} linhas, "
         f"{n_tickers_depois} de {n_tickers_antes} tickers mantidos após filtro de liquidez."
     )
 
@@ -188,6 +257,8 @@ if "dados_grafo" in st.session_state:
             ir_mensal = ge.calcular_ir_mensal(
                 operacoes, ir_aliquota=d["ir_aliquota"], isencao_vendas_mensal=d["isencao_mensal"]
             )
+            if d.get("df_benchmarks") is not None and not resumo.empty:
+                resumo = ge.calcular_benchmarks_externos(d["df_benchmarks"], resumo)
             st.session_state.resultado_backtest_grafo = (operacoes, resumo, ir_mensal, d["capital"])
 
     if "resultado_backtest_grafo" in st.session_state:
@@ -224,11 +295,20 @@ if "dados_grafo" in st.session_state:
 
             grafico_df = pd.DataFrame(index=resumo["data_decisao"])
             grafico_df["Estratégia"] = (resumo["capital_apos_periodo"].values / capital_inicial) * 100
-            
+
             if "retorno_benchmark" in resumo.columns:
                 retornos_bench = resumo["retorno_benchmark"].values
                 acumulado_bench = 100 * (1 + retornos_bench).cumprod()
                 grafico_df["Benchmark (Equal-Weight)"] = acumulado_bench
+
+            nomes_benchmarks_externos = {
+                "retorno_selic": "Selic",
+                "retorno_cdi": "CDI",
+                "retorno_ibovespa": "Ibovespa",
+            }
+            for coluna, nome in nomes_benchmarks_externos.items():
+                if coluna in resumo.columns:
+                    grafico_df[nome] = 100 * (1 + resumo[coluna].values).cumprod()
 
             st.line_chart(grafico_df)
 

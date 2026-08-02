@@ -61,13 +61,14 @@ extensões.
 
 ```
 .
-├── b3_cotahist.py       # Pipeline de dados: baixa e converte COTAHIST da B3
-├── grafo_estrategia.py  # Lógica da estratégia (grafo, sinal, backtest, IR)
-├── app_grafo.py         # Interface Streamlit
-├── requirements.txt     # Dependências Python
+├── b3_cotahist.py          # Pipeline de dados: baixa e converte COTAHIST da B3
+├── benchmarks_externos.py  # Baixa Selic, CDI (BCB) e Ibovespa (yfinance) — opcional
+├── grafo_estrategia.py     # Lógica da estratégia (grafo, sinal, backtest, IR)
+├── app_grafo.py            # Interface Streamlit
+├── requirements.txt        # Dependências Python
 ├── .streamlit/
-│   └── config.toml      # Limite de upload do Streamlit (1 GB — ver seção 4)
-└── readme.md            # Este arquivo
+│   └── config.toml         # Limite de upload do Streamlit (1 GB — ver seção 4)
+└── readme.md               # Este arquivo
 ```
 
 ### `b3_cotahist.py` — coleta de dados
@@ -90,6 +91,34 @@ Roda de forma independente, via linha de comando — **não** é chamado
 automaticamente pelo app Streamlit. O resultado (arquivo `.parquet` ou
 `.csv` em `dados_b3/processed/`) é o que você sobe manualmente no app.
 
+### `benchmarks_externos.py` — Selic, CDI e Ibovespa (opcional)
+
+Fornece três benchmarks externos para comparação mais ampla, além do
+equal-weight já embutido no backtest: **Selic** e **CDI** (Banco Central,
+API SGS oficial) e **Ibovespa** (Yahoo Finance, ticker `^BVSP` — a B3 não
+disponibiliza a série do índice via API pública simples).
+
+**Modo automático (recomendado):** no `app_grafo.py`, escolha "Buscar
+automaticamente (Selic/CDI/Ibovespa)" no seletor de benchmarks — o app
+chama as APIs direto no intervalo de datas dos dados carregados, com
+resultado em cache (não bate na API de novo a cada clique em "Rodar
+backtest"). Requer internet no momento de clicar em "Carregar dados" e a
+dependência `yfinance` instalada.
+
+**Modo manual (linha de comando, útil para gerar o arquivo com
+antecedência ou sem depender de internet na hora da demo):**
+
+```bash
+python benchmarks_externos.py --inicio 2020-01-01 --fim 2026-07-30
+```
+
+Gera um arquivo com colunas `data`, `selic_diaria`, `cdi_diario`,
+`ibovespa_fechamento`, que pode ser subido no seletor de benchmarks do
+app escolhendo "Subir arquivo". Se a busca automática falhar (API fora
+do ar, sem internet), o app avisa e sugere esse caminho manual como
+alternativa — o backtest continua rodando normalmente com o benchmark
+equal-weight de qualquer forma.
+
 ### `grafo_estrategia.py` — núcleo da estratégia
 
 Módulo **autossuficiente**: não importa nada de um eventual `core.py` de
@@ -109,6 +138,7 @@ Principais funções:
 | `backtest_grafo` | Loop de simulação completo: decide, aloca, realiza, avança |
 | `calcular_metricas_risco` | Retorno anualizado, volatilidade anualizada, Sharpe e drawdown máximo a partir do `resumo` do backtest |
 | `calcular_benchmark_equalweight` | Retorno médio equal-weight de todos os tickers disponíveis, como proxy de "comprar o mercado" |
+| `calcular_benchmarks_externos` | Retorno de Selic, CDI e Ibovespa no mesmo intervalo de cada período de decisão, a partir do arquivo gerado por `benchmarks_externos.py` |
 | `calcular_ir_mensal` | Apuração de IR mensal (regra de swing trade, Lei 11.033/2004, Art. 3º, II) |
 
 ### `app_grafo.py` — interface
@@ -154,12 +184,17 @@ o app combina e remove sobreposições automaticamente) → clique em
 
 ## 6. Limitações conhecidas
 
-- O benchmark disponível hoje é uma aproximação **equal-weight** do
-  universo de ações do COTAHIST (após o filtro de liquidez), não o
-  Ibovespa oficial (que é ponderado por valor de mercado free-float). Para
-  o Ibovespa real seria necessário buscar a série `^BVSP` de uma fonte
-  externa, fora do escopo atual por adicionar dependência de rede não
-  solicitada.
+- O benchmark **sempre calculado** (embutido no `backtest_grafo`) é uma
+  aproximação **equal-weight** do universo de ações do COTAHIST, não o
+  Ibovespa oficial. Selic, CDI e Ibovespa (via `^BVSP`, Yahoo Finance) já
+  estão disponíveis como comparação **opcional**, buscados automaticamente
+  no próprio `app_grafo.py` (com cache) ou via upload manual do arquivo
+  gerado por `benchmarks_externos.py` — mas dependem de fontes externas
+  (BCB e Yahoo Finance), então exigem conexão de rede no momento da busca
+  e podem falhar se essas APIs estiverem instáveis (o app cai de volta
+  para o benchmark equal-weight nesse caso, sem travar o backtest).
+  O Ibovespa via Yahoo Finance também não é a fonte oficial da B3 (que só
+  disponibiliza a série do índice por download manual).
 - O backtest ainda não tem validação **walk-forward** automatizada (rodar
   em múltiplos blocos de tempo e reportar a distribuição de resultados),
   teste de significância contra um baseline aleatório, nem grade de

@@ -306,6 +306,70 @@ def calcular_benchmark_equalweight(
     return pd.DataFrame(linhas)
 
 
+def calcular_benchmarks_externos(
+    df_benchmarks: pd.DataFrame,
+    resumo: pd.DataFrame,
+) -> pd.DataFrame:
+    """Recebe o `resumo` já retornado por `backtest_grafo` e um
+    `df_benchmarks` (saída de `benchmarks_externos.py`, colunas: `data`,
+    `selic_diaria`, `cdi_diario` em % ao dia, `ibovespa_fechamento` em
+    nível do índice). Para cada linha de `resumo` (um período de decisão
+    -> venda), calcula o retorno de cada benchmark no MESMO intervalo de
+    datas, para comparação justa:
+    - retorno_selic / retorno_cdi: taxas diárias compostas no período
+      (produtório de (1 + taxa/100) - 1).
+    - retorno_ibovespa: variação percentual do fechamento entre a data de
+      decisão e a data de venda prevista.
+    Retorna `resumo` com essas 3 colunas novas. Períodos sem
+    `data_venda_prevista` (fim do histórico) ficam com retorno 0.0.
+    """
+    if df_benchmarks.empty or resumo.empty:
+        vazio = resumo.copy()
+        for col in ("retorno_selic", "retorno_cdi", "retorno_ibovespa"):
+            vazio[col] = 0.0
+        return vazio
+
+    bench = df_benchmarks.copy()
+    bench["data"] = pd.to_datetime(bench["data"])
+    bench = bench.set_index("data").sort_index()
+
+    linhas = []
+    for _, row in resumo.iterrows():
+        ini = pd.Timestamp(row["data_decisao"])
+        fim = row.get("data_venda_prevista")
+        fim = pd.Timestamp(fim) if pd.notna(fim) else None
+
+        if fim is None:
+            linhas.append({"retorno_selic": 0.0, "retorno_cdi": 0.0, "retorno_ibovespa": 0.0})
+            continue
+
+        janela = bench[(bench.index > ini) & (bench.index <= fim)]
+
+        retorno_selic = 0.0
+        if "selic_diaria" in janela.columns and not janela["selic_diaria"].dropna().empty:
+            retorno_selic = float((1 + janela["selic_diaria"].fillna(0) / 100).prod() - 1)
+
+        retorno_cdi = 0.0
+        if "cdi_diario" in janela.columns and not janela["cdi_diario"].dropna().empty:
+            retorno_cdi = float((1 + janela["cdi_diario"].fillna(0) / 100).prod() - 1)
+
+        retorno_ibovespa = 0.0
+        if "ibovespa_fechamento" in bench.columns:
+            preco_ini = bench.loc[bench.index <= ini, "ibovespa_fechamento"].dropna()
+            preco_fim = bench.loc[bench.index <= fim, "ibovespa_fechamento"].dropna()
+            if len(preco_ini) and len(preco_fim):
+                retorno_ibovespa = float(preco_fim.iloc[-1] / preco_ini.iloc[-1] - 1)
+
+        linhas.append({
+            "retorno_selic": retorno_selic,
+            "retorno_cdi": retorno_cdi,
+            "retorno_ibovespa": retorno_ibovespa,
+        })
+
+    extras = pd.DataFrame(linhas)
+    return pd.concat([resumo.reset_index(drop=True), extras], axis=1)
+
+
 # ---------------------------------------------------------------------------
 # Backtest
 # ---------------------------------------------------------------------------

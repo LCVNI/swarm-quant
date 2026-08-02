@@ -1,0 +1,5 @@
+# Ignorar arquivos parquet
+*.parquet
+
+# Ignorar arquivos zip
+*.zip
