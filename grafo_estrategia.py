@@ -160,7 +160,15 @@ def construir_grafo_correlacao(
 
 
 def calcular_sinal_grafo(grafo: nx.Graph, retornos_recentes: pd.Series) -> pd.DataFrame:
-    """`retornos_recentes`: Series ticker -> retorno recente (ex: retorno_5d) na data de decisão."""
+    """`retornos_recentes`: Series ticker -> retorno recente (ex: retorno_5d) na data de decisão.
+
+    A contribuição de cada vizinho é ponderada pela FORÇA da correlação
+    (abs(peso)) mas ajustada pela DIREÇÃO dela (sinal do peso): um vizinho
+    negativamente correlacionado que subiu contribui como se tivesse
+    caído, e vice-versa — antes o código usava só a força e ignorava a
+    direção, tratando vizinhos com correlação negativa como se fossem
+    positivos.
+    """
     linhas = []
     for ticker in grafo.nodes:
         if ticker not in retornos_recentes.index or pd.isna(retornos_recentes.get(ticker)):
@@ -169,16 +177,17 @@ def calcular_sinal_grafo(grafo: nx.Graph, retornos_recentes: pd.Series) -> pd.Da
         if not vizinhos:
             continue
 
-        pesos, retornos_viz = [], []
+        pesos, retornos_viz_ajustados = [], []
         for v in vizinhos:
             r = retornos_recentes.get(v, np.nan)
             if pd.notna(r):
-                pesos.append(abs(grafo[ticker][v]["weight"]))
-                retornos_viz.append(r)
+                peso = grafo[ticker][v]["weight"]
+                pesos.append(abs(peso))
+                retornos_viz_ajustados.append(r * np.sign(peso))
         if not pesos or sum(pesos) == 0:
             continue
 
-        media_vizinhos = float(np.average(retornos_viz, weights=pesos))
+        media_vizinhos = float(np.average(retornos_viz_ajustados, weights=pesos))
         retorno_proprio = float(retornos_recentes[ticker])
         linhas.append({
             "ticker": ticker,
