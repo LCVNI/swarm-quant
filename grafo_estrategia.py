@@ -83,6 +83,38 @@ def construir_features_grafo(df: pd.DataFrame, horizonte: int = HORIZONTE_PADRAO
     return df
 
 
+LIMITE_RETORNO_DIARIO_PADRAO = 0.80  # 80% num único pregão
+
+
+def sanitizar_outliers_retorno(
+    df: pd.DataFrame, limite_retorno_diario: float = LIMITE_RETORNO_DIARIO_PADRAO
+) -> tuple[pd.DataFrame, int]:
+    """O COTAHIST bruto da B3 NÃO ajusta preços para desdobramentos,
+    grupamentos ou bonificações. Um evento desses aparece como um
+    'retorno' de centenas de % num único pregão — não é um movimento real
+    de mercado, é um artefato de dado não ajustado. Como o sinal de
+    spillover rankeia pelas maiores divergências, a estratégia é atraída
+    justamente para esses artefatos, distorcendo o backtest inteiro.
+
+    Neutraliza (vira NaN) qualquer valor de retorno_1d, retorno_5d ou
+    retorno_futuro cujo módulo ultrapasse `limite_retorno_diario`,
+    coluna por coluna (não descarta o ticker inteiro, só o ponto
+    suspeito — outros dias do mesmo ticker continuam válidos). Linhas
+    com NaN nessas colunas já são excluídas do backtest via
+    `backtest_grafo` (dropna em `retorno_1d`/`retorno_5d`/`retorno_futuro`).
+
+    Retorna (df_corrigido, n_valores_neutralizados) para você poder
+    reportar quantos pontos suspeitos foram encontrados.
+    """
+    df = df.copy()
+    n_afetados = 0
+    for col in ("retorno_1d", "retorno_5d", "retorno_futuro"):
+        suspeitos = df[col].abs() > limite_retorno_diario
+        n_afetados += int(suspeitos.sum())
+        df.loc[suspeitos, col] = np.nan
+    return df, n_afetados
+
+
 def _pivot_retornos(df: pd.DataFrame, coluna: str = "retorno_1d") -> pd.DataFrame:
     return df.pivot(index="data_pregao", columns="ticker", values=coluna)
 
