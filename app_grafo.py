@@ -129,6 +129,19 @@ with st.expander("Filtro de liquidez"):
         help="Quantos pregões passados usar para calcular a média móvel de número de negócios.",
     )
 
+with st.expander("Sanidade de dados (desdobramentos/grupamentos não ajustados no COTAHIST)"):
+    st.caption(
+        "O COTAHIST bruto não ajusta preços para desdobramentos, grupamentos ou "
+        "bonificações — um evento desses aparece como um retorno de centenas de % "
+        "num único pregão, o que distorce tanto o sinal quanto o backtest."
+    )
+    filtrar_outliers = st.checkbox("Neutralizar retornos suspeitos de desdobramento/grupamento", value=True)
+    limite_retorno_diario_pct = st.number_input(
+        "Limite de retorno diário considerado suspeito (%)", min_value=10, max_value=500, value=80, step=10,
+        help="Acima disso, o valor é tratado como artefato de dado bruto (não movimento real de mercado) e anulado.",
+        disabled=not filtrar_outliers,
+    )
+
 with st.expander("Custos de transação (B3 + corretagem + ISS)"):
     c1, c2, c3 = st.columns(3)
     taxa_b3_pct = c1.number_input(
@@ -186,22 +199,10 @@ if arquivos and st.button("Carregar dados"):
         n_tickers_depois = df["ticker"].nunique()
         df = ge.construir_features_grafo(df, horizonte=int(horizonte))
 
-        df_benchmarks = None
-        erro_benchmarks = None
-        if modo_benchmarks == "Buscar automaticamente (Selic/CDI/Ibovespa)":
-            try:
-                data_ini_str = df["data_pregao"].min().strftime("%Y-%m-%d")
-                data_fim_str = df["data_pregao"].max().strftime("%Y-%m-%d")
-                df_benchmarks = _buscar_benchmarks_automaticamente(data_ini_str, data_fim_str, brapi_token)
-            except Exception as exc:
-                erro_benchmarks = str(exc)
-        elif modo_benchmarks == "Subir arquivo (benchmarks_externos.py)" and arquivo_benchmarks is not None:
-            caminho_bench = Path(arquivo_benchmarks.name)
-            with caminho_bench.open("wb") as f:
-                f.write(arquivo_benchmarks.getbuffer())
-            df_benchmarks = (
-                pd.read_parquet(caminho_bench) if caminho_bench.suffix == ".parquet"
-                else pd.read_csv(caminho_bench, parse_dates=["data"])
+        n_outliers = 0
+        if filtrar_outliers:
+            df, n_outliers = ge.sanitizar_outliers_retorno(
+                df, limite_retorno_diario=limite_retorno_diario_pct / 100
             )
 
     st.session_state.dados_grafo = dict(
@@ -212,31 +213,21 @@ if arquivos and st.button("Carregar dados"):
         corretagem_percentual=corretagem_percentual / 100, iss_pct=iss_pct / 100,
         irrf_pct=irrf_pct / 100, ir_aliquota=ir_aliquota_pct / 100,
         isencao_mensal=isencao_mensal, taxa_livre_risco=taxa_livre_risco / 100,
-        df_benchmarks=df_benchmarks,
     )
-    if erro_benchmarks:
-        st.warning(
-            f"Não foi possível buscar nenhum benchmark externo automaticamente ({erro_benchmarks}). "
-            "O backtest segue normalmente com o benchmark equal-weight; gere o arquivo com "
-            "`benchmarks_externos.py` e suba manualmente se quiser tentar de novo."
-        )
-    msg_bench = ""
-    if df_benchmarks is not None:
-        obtidos = []
-        if "selic_diaria" in df_benchmarks.columns and df_benchmarks["selic_diaria"].notna().any():
-            obtidos.append("Selic")
-        if "cdi_diario" in df_benchmarks.columns and df_benchmarks["cdi_diario"].notna().any():
-            obtidos.append("CDI")
-        if "ibovespa_fechamento" in df_benchmarks.columns and df_benchmarks["ibovespa_fechamento"].notna().any():
-            obtidos.append("Ibovespa")
-        if obtidos:
-            msg_bench = f" + benchmarks externos ({', '.join(obtidos)})"
-        faltando = {"Selic", "CDI", "Ibovespa"} - set(obtidos)
-        if faltando:
-            st.warning(f"Não foi possível obter: {', '.join(sorted(faltando))}. Os demais benchmarks disponíveis seguem normalmente.")
     st.success(
-        f"Dados carregados de {len(arquivos)} arquivo(s){msg_bench}: {len(df):,} linhas, "
+        f"Dados carregados de {len(arquivos)} arquivo(s): {len(df):,} linhas, "
         f"{n_tickers_depois} de {n_tickers_antes} tickers mantidos após filtro de liquidez."
+    )
+    if filtrar_outliers and n_outliers > 0:
+        st.info(
+            f"{n_outliers} valores de retorno acima de {limite_retorno_diario_pct}% num único "
+            "pregão foram neutralizados (prováveis desdobramentos/grupamentos não ajustados "
+            "no COTAHIST bruto, não movimento real de mercado)."
+        )
+    st.caption(
+        "Benchmarks externos (Selic/CDI/Ibovespa) são buscados/lidos no momento em que você "
+        "clicar em 'Rodar backtest' logo abaixo, usando a opção selecionada no seletor acima "
+        "— não precisa recarregar os dados de novo se mudar essa opção."
     )
 
 if "dados_grafo" in st.session_state:
@@ -279,8 +270,50 @@ if "dados_grafo" in st.session_state:
             ir_mensal = ge.calcular_ir_mensal(
                 operacoes, ir_aliquota=d["ir_aliquota"], isencao_vendas_mensal=d["isencao_mensal"]
             )
-            if d.get("df_benchmarks") is not None and not resumo.empty:
-                resumo = ge.calcular_benchmarks_externos(d["df_benchmarks"], resumo)
+
+            df_benchmarks = None
+            erro_benchmarks = None
+            if modo_benchmarks == "Buscar automaticamente (Selic/CDI/Ibovespa)":
+                try:
+                    data_ini_str = df["data_pregao"].min().strftime("%Y-%m-%d")
+                    data_fim_str = df["data_pregao"].max().strftime("%Y-%m-%d")
+                    df_benchmarks = _buscar_benchmarks_automaticamente(data_ini_str, data_fim_str, brapi_token)
+                except Exception as exc:
+                    erro_benchmarks = str(exc)
+            elif modo_benchmarks == "Subir arquivo (benchmarks_externos.py)" and arquivo_benchmarks is not None:
+                caminho_bench = Path(arquivo_benchmarks.name)
+                with caminho_bench.open("wb") as f:
+                    f.write(arquivo_benchmarks.getbuffer())
+                df_benchmarks = (
+                    pd.read_parquet(caminho_bench) if caminho_bench.suffix == ".parquet"
+                    else pd.read_csv(caminho_bench, parse_dates=["data"])
+                )
+
+            if erro_benchmarks:
+                st.warning(
+                    f"Não foi possível buscar nenhum benchmark externo automaticamente ({erro_benchmarks}). "
+                    "O backtest segue com o benchmark equal-weight; gere o arquivo com "
+                    "`benchmarks_externos.py` e suba manualmente se quiser tentar de novo."
+                )
+            elif modo_benchmarks == "Subir arquivo (benchmarks_externos.py)" and arquivo_benchmarks is None:
+                st.warning("Nenhum arquivo de benchmarks foi selecionado no uploader acima — seguindo só com o equal-weight.")
+
+            if df_benchmarks is not None:
+                obtidos = []
+                if "selic_diaria" in df_benchmarks.columns and df_benchmarks["selic_diaria"].notna().any():
+                    obtidos.append("Selic")
+                if "cdi_diario" in df_benchmarks.columns and df_benchmarks["cdi_diario"].notna().any():
+                    obtidos.append("CDI")
+                if "ibovespa_fechamento" in df_benchmarks.columns and df_benchmarks["ibovespa_fechamento"].notna().any():
+                    obtidos.append("Ibovespa")
+                faltando = {"Selic", "CDI", "Ibovespa"} - set(obtidos)
+                if obtidos:
+                    st.caption(f"Benchmarks externos no gráfico: {', '.join(obtidos)}.")
+                if faltando:
+                    st.warning(f"Não foi possível obter: {', '.join(sorted(faltando))}.")
+
+            if df_benchmarks is not None and not resumo.empty:
+                resumo = ge.calcular_benchmarks_externos(df_benchmarks, resumo)
             st.session_state.resultado_backtest_grafo = (operacoes, resumo, ir_mensal, d["capital"])
 
     if "resultado_backtest_grafo" in st.session_state:
