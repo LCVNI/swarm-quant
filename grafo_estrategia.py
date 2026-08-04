@@ -54,25 +54,6 @@ def carregar_dados(caminho: str) -> pd.DataFrame:
     return df.sort_values(["ticker", "data_pregao"])
 
 
-def filtrar_liquidez(
-    df: pd.DataFrame,
-    min_negocios_medio: int = 100,
-    janela_liquidez: int = 20,
-) -> pd.DataFrame:
-    """Remove tickers cuja média móvel de `numero_negocios` (janela de
-    `janela_liquidez` pregões) fica abaixo de `min_negocios_medio` na data
-    de referência. Evita que ações pouco líquidas entrem no grafo de
-    correlação (correlações espúrias) e no backtest (preços de fechamento
-    pouco representativos de uma execução real).
-    """
-    df = df.copy()
-    df["media_negocios"] = df.groupby("ticker")["numero_negocios"].transform(
-        lambda s: s.rolling(janela_liquidez, min_periods=1).mean()
-    )
-    df = df[df["media_negocios"] >= min_negocios_medio].copy()
-    return df.drop(columns=["media_negocios"])
-
-
 def construir_features_grafo(df: pd.DataFrame, horizonte: int = HORIZONTE_PADRAO) -> pd.DataFrame:
     """Só o que a estratégia de grafo precisa: retorno_1d (monta o grafo),
     retorno_5d (sinal de curto prazo) e retorno_futuro (realização real)."""
@@ -81,38 +62,6 @@ def construir_features_grafo(df: pd.DataFrame, horizonte: int = HORIZONTE_PADRAO
     df["retorno_5d"] = g.pct_change(5)
     df["retorno_futuro"] = g.transform(lambda s: s.shift(-horizonte) / s - 1)
     return df
-
-
-LIMITE_RETORNO_DIARIO_PADRAO = 0.80  # 80% num único pregão
-
-
-def sanitizar_outliers_retorno(
-    df: pd.DataFrame, limite_retorno_diario: float = LIMITE_RETORNO_DIARIO_PADRAO
-) -> tuple[pd.DataFrame, int]:
-    """O COTAHIST bruto da B3 NÃO ajusta preços para desdobramentos,
-    grupamentos ou bonificações. Um evento desses aparece como um
-    'retorno' de centenas de % num único pregão — não é um movimento real
-    de mercado, é um artefato de dado não ajustado. Como o sinal de
-    spillover rankeia pelas maiores divergências, a estratégia é atraída
-    justamente para esses artefatos, distorcendo o backtest inteiro.
-
-    Neutraliza (vira NaN) qualquer valor de retorno_1d, retorno_5d ou
-    retorno_futuro cujo módulo ultrapasse `limite_retorno_diario`,
-    coluna por coluna (não descarta o ticker inteiro, só o ponto
-    suspeito — outros dias do mesmo ticker continuam válidos). Linhas
-    com NaN nessas colunas já são excluídas do backtest via
-    `backtest_grafo` (dropna em `retorno_1d`/`retorno_5d`/`retorno_futuro`).
-
-    Retorna (df_corrigido, n_valores_neutralizados) para você poder
-    reportar quantos pontos suspeitos foram encontrados.
-    """
-    df = df.copy()
-    n_afetados = 0
-    for col in ("retorno_1d", "retorno_5d", "retorno_futuro"):
-        suspeitos = df[col].abs() > limite_retorno_diario
-        n_afetados += int(suspeitos.sum())
-        df.loc[suspeitos, col] = np.nan
-    return df, n_afetados
 
 
 def _pivot_retornos(df: pd.DataFrame, coluna: str = "retorno_1d") -> pd.DataFrame:
@@ -128,13 +77,7 @@ def construir_grafo_correlacao(
     janela: int = JANELA_CORRELACAO_PADRAO,
     limiar_correlacao: float = LIMIAR_CORRELACAO_PADRAO,
 ) -> nx.Graph:
-    """Grafo de correlação usando só dados ANTERIORES a `data_referencia` (sem vazamento).
-
-    Extração de arestas vetorizada com numpy (só a triangular superior da
-    matriz de correlação, sem diagonal) em vez de um loop duplo em Python
-    puro sobre todos os pares de tickers — mesmo grafo, mesmos pesos,
-    mesmo critério de corte, só mais rápido para universos grandes.
-    """
+    """Grafo de correlação usando só dados ANTERIORES a `data_referencia` (sem vazamento)."""
     janela_dados = retornos_pivot[retornos_pivot.index < data_referencia].tail(janela)
     grafo = nx.Graph()
     if len(janela_dados) < max(20, janela // 3):
@@ -142,33 +85,17 @@ def construir_grafo_correlacao(
 
     corr = janela_dados.corr(min_periods=max(20, janela // 3))
     grafo.add_nodes_from(corr.columns)
-
-    colunas = corr.columns.to_numpy()
-    valores = corr.to_numpy()
-    n = len(colunas)
-    if n < 2:
-        return grafo
-
-    i_idx, j_idx = np.triu_indices(n, k=1)
-    pesos = valores[i_idx, j_idx]
-    mascara = np.isfinite(pesos) & (np.abs(pesos) >= limiar_correlacao)
-
-    for i, j, peso in zip(i_idx[mascara], j_idx[mascara], pesos[mascara]):
-        grafo.add_edge(colunas[i], colunas[j], weight=float(peso))
-
+    colunas = list(corr.columns)
+    for i, t1 in enumerate(colunas):
+        for t2 in colunas[i + 1:]:
+            peso = corr.loc[t1, t2]
+            if pd.notna(peso) and abs(peso) >= limiar_correlacao:
+                grafo.add_edge(t1, t2, weight=float(peso))
     return grafo
 
 
 def calcular_sinal_grafo(grafo: nx.Graph, retornos_recentes: pd.Series) -> pd.DataFrame:
-    """`retornos_recentes`: Series ticker -> retorno recente (ex: retorno_5d) na data de decisão.
-
-    A contribuição de cada vizinho é ponderada pela FORÇA da correlação
-    (abs(peso)) mas ajustada pela DIREÇÃO dela (sinal do peso): um vizinho
-    negativamente correlacionado que subiu contribui como se tivesse
-    caído, e vice-versa — antes o código usava só a força e ignorava a
-    direção, tratando vizinhos com correlação negativa como se fossem
-    positivos.
-    """
+    """`retornos_recentes`: Series ticker -> retorno recente (ex: retorno_5d) na data de decisão."""
     linhas = []
     for ticker in grafo.nodes:
         if ticker not in retornos_recentes.index or pd.isna(retornos_recentes.get(ticker)):
@@ -177,17 +104,16 @@ def calcular_sinal_grafo(grafo: nx.Graph, retornos_recentes: pd.Series) -> pd.Da
         if not vizinhos:
             continue
 
-        pesos, retornos_viz_ajustados = [], []
+        pesos, retornos_viz = [], []
         for v in vizinhos:
             r = retornos_recentes.get(v, np.nan)
             if pd.notna(r):
-                peso = grafo[ticker][v]["weight"]
-                pesos.append(abs(peso))
-                retornos_viz_ajustados.append(r * np.sign(peso))
+                pesos.append(abs(grafo[ticker][v]["weight"]))
+                retornos_viz.append(r)
         if not pesos or sum(pesos) == 0:
             continue
 
-        media_vizinhos = float(np.average(retornos_viz_ajustados, weights=pesos))
+        media_vizinhos = float(np.average(retornos_viz, weights=pesos))
         retorno_proprio = float(retornos_recentes[ticker])
         linhas.append({
             "ticker": ticker,
@@ -278,154 +204,6 @@ def calcular_ir_mensal(
 
 
 # ---------------------------------------------------------------------------
-# Métricas e Benchmark
-# ---------------------------------------------------------------------------
-def calcular_metricas_risco(
-    resumo: pd.DataFrame,
-    capital_inicial: float,
-    dias_por_periodo: int,
-    taxa_livre_risco_anual: float = 0.0,
-) -> dict:
-    """A partir da coluna `capital_apos_periodo` de `resumo`, calcula:
-    - retorno_total: (capital_final / capital_inicial) - 1
-    - retorno_anualizado: composto, usando dias_por_periodo * n_periodos
-    - volatilidade_anualizada: desvio padrão dos retornos por período, anualizado
-    - sharpe: (retorno_anualizado - taxa_livre_risco_anual) / volatilidade_anualizada
-    - drawdown_maximo: maior queda percentual do capital acumulado
-    """
-    if resumo.empty:
-        return {
-            "retorno_total": 0.0,
-            "retorno_anualizado": 0.0,
-            "volatilidade_anualizada": 0.0,
-            "sharpe": 0.0,
-            "drawdown_maximo": 0.0,
-        }
-
-    serie = resumo["capital_apos_periodo"]
-    capital_final = serie.iloc[-1]
-    retorno_total = (capital_final / capital_inicial) - 1
-
-    n_periodos = len(serie)
-    dias_totais = n_periodos * dias_por_periodo
-    anos_totais = dias_totais / 252
-
-    if anos_totais > 0:
-        retorno_anualizado = (capital_final / capital_inicial) ** (1 / anos_totais) - 1
-    else:
-        retorno_anualizado = retorno_total
-
-    capital_com_inicial = pd.concat([pd.Series([capital_inicial]), serie])
-    retornos_periodo = capital_com_inicial.pct_change().dropna()
-    periodos_por_ano = 252 / dias_por_periodo
-
-    volatilidade_anualizada = retornos_periodo.std() * (periodos_por_ano ** 0.5)
-    if pd.isna(volatilidade_anualizada) or volatilidade_anualizada == 0:
-        volatilidade_anualizada = 0.0
-        sharpe = 0.0
-    else:
-        sharpe = (retorno_anualizado - taxa_livre_risco_anual) / volatilidade_anualizada
-
-    pico = serie.cummax()
-    drawdown = (serie - pico) / pico
-    drawdown_maximo = drawdown.min()
-
-    return {
-        "retorno_total": float(retorno_total),
-        "retorno_anualizado": float(retorno_anualizado),
-        "volatilidade_anualizada": float(volatilidade_anualizada),
-        "sharpe": float(sharpe),
-        "drawdown_maximo": float(drawdown_maximo),
-    }
-
-
-def calcular_benchmark_equalweight(
-    df_features: pd.DataFrame,
-    datas_decisao: list,
-    horizonte: int,
-) -> pd.DataFrame:
-    """Para cada data de decisão em `datas_decisao`, calcula o retorno
-    médio simples (equal-weight) de `retorno_futuro` entre todos os
-    tickers disponíveis naquela data, como proxy de 'comprar o mercado'.
-    Retorna DataFrame com colunas: data_decisao, retorno_benchmark.
-    """
-    linhas = []
-    for data_decisao in datas_decisao:
-        dt_decisao = pd.Timestamp(data_decisao)
-        candidatos_dia = df_features[df_features["data_pregao"] == dt_decisao]
-        retorno_medio = candidatos_dia["retorno_futuro"].mean() if not candidatos_dia.empty else 0.0
-        linhas.append({
-            "data_decisao": data_decisao,
-            "retorno_benchmark": float(retorno_medio) if pd.notna(retorno_medio) else 0.0
-        })
-    return pd.DataFrame(linhas)
-
-
-def calcular_benchmarks_externos(
-    df_benchmarks: pd.DataFrame,
-    resumo: pd.DataFrame,
-) -> pd.DataFrame:
-    """Recebe o `resumo` já retornado por `backtest_grafo` e um
-    `df_benchmarks` (saída de `benchmarks_externos.py`, colunas: `data`,
-    `selic_diaria`, `cdi_diario` em % ao dia, `ibovespa_fechamento` em
-    nível do índice). Para cada linha de `resumo` (um período de decisão
-    -> venda), calcula o retorno de cada benchmark no MESMO intervalo de
-    datas, para comparação justa:
-    - retorno_selic / retorno_cdi: taxas diárias compostas no período
-      (produtório de (1 + taxa/100) - 1).
-    - retorno_ibovespa: variação percentual do fechamento entre a data de
-      decisão e a data de venda prevista.
-    Retorna `resumo` com essas 3 colunas novas. Períodos sem
-    `data_venda_prevista` (fim do histórico) ficam com retorno 0.0.
-    """
-    if df_benchmarks.empty or resumo.empty:
-        vazio = resumo.copy()
-        for col in ("retorno_selic", "retorno_cdi", "retorno_ibovespa"):
-            vazio[col] = 0.0
-        return vazio
-
-    bench = df_benchmarks.copy()
-    bench["data"] = pd.to_datetime(bench["data"])
-    bench = bench.set_index("data").sort_index()
-
-    linhas = []
-    for _, row in resumo.iterrows():
-        ini = pd.Timestamp(row["data_decisao"])
-        fim = row.get("data_venda_prevista")
-        fim = pd.Timestamp(fim) if pd.notna(fim) else None
-
-        if fim is None:
-            linhas.append({"retorno_selic": 0.0, "retorno_cdi": 0.0, "retorno_ibovespa": 0.0})
-            continue
-
-        janela = bench[(bench.index > ini) & (bench.index <= fim)]
-
-        retorno_selic = 0.0
-        if "selic_diaria" in janela.columns and not janela["selic_diaria"].dropna().empty:
-            retorno_selic = float((1 + janela["selic_diaria"].fillna(0) / 100).prod() - 1)
-
-        retorno_cdi = 0.0
-        if "cdi_diario" in janela.columns and not janela["cdi_diario"].dropna().empty:
-            retorno_cdi = float((1 + janela["cdi_diario"].fillna(0) / 100).prod() - 1)
-
-        retorno_ibovespa = 0.0
-        if "ibovespa_fechamento" in bench.columns:
-            preco_ini = bench.loc[bench.index <= ini, "ibovespa_fechamento"].dropna()
-            preco_fim = bench.loc[bench.index <= fim, "ibovespa_fechamento"].dropna()
-            if len(preco_ini) and len(preco_fim):
-                retorno_ibovespa = float(preco_fim.iloc[-1] / preco_ini.iloc[-1] - 1)
-
-        linhas.append({
-            "retorno_selic": retorno_selic,
-            "retorno_cdi": retorno_cdi,
-            "retorno_ibovespa": retorno_ibovespa,
-        })
-
-    extras = pd.DataFrame(linhas)
-    return pd.concat([resumo.reset_index(drop=True), extras], axis=1)
-
-
-# ---------------------------------------------------------------------------
 # Backtest
 # ---------------------------------------------------------------------------
 def backtest_grafo(
@@ -455,9 +233,7 @@ def backtest_grafo(
     base = df_features.dropna(subset=["retorno_1d", "retorno_5d", "retorno_futuro"]).copy()
     datas = np.sort(base["data_pregao"].unique())
     retornos_pivot = _pivot_retornos(df_features)
-    
-    custo_fixo_pct_estimado = 2 * corretagem_fixa / capital_max_por_acao if capital_max_por_acao > 0 else 0.0
-    custo_pct_ida_volta_estimado = 2 * (taxa_b3 + corretagem_percentual * (1 + iss_pct)) + custo_fixo_pct_estimado
+    custo_pct_ida_volta = 2 * (taxa_b3 + corretagem_percentual * (1 + iss_pct))
 
     capital_disponivel = capital_total
     operacoes = []
@@ -481,7 +257,7 @@ def backtest_grafo(
 
         retornos_recentes = candidatos_dia.set_index("ticker")["retorno_5d"]
         sinal = calcular_sinal_grafo(grafo, retornos_recentes)
-        sinal = sinal[sinal["sinal_spillover"] > custo_pct_ida_volta_estimado].head(top_n)
+        sinal = sinal[sinal["sinal_spillover"] > custo_pct_ida_volta].head(top_n)
         if sinal.empty:
             i += horizonte
             continue
@@ -519,25 +295,15 @@ def backtest_grafo(
                 "lucro": round(lucro, 2),
             })
 
-        capital_alocado = float(selecionados["valor_alocado"].sum()) if not selecionados.empty else 0.0
-        pct_capital_alocado = capital_alocado / capital_disponivel if capital_disponivel > 0 else 0.0
-
         capital_disponivel += lucro_periodo
         resumo.append({
             "data_decisao": pd.Timestamp(data_decisao).date(),
             "data_venda_prevista": data_venda.date() if pd.notna(data_venda) else None,
             "n_operacoes": len(selecionados),
             "n_arestas_grafo": grafo.number_of_edges(),
-            "capital_alocado": round(capital_alocado, 2),
-            "pct_capital_alocado": round(pct_capital_alocado, 4),
             "lucro_periodo": round(lucro_periodo, 2),
             "capital_apos_periodo": round(capital_disponivel, 2),
         })
         i += horizonte
 
-    df_resumo = pd.DataFrame(resumo)
-    if not df_resumo.empty:
-        df_bench = calcular_benchmark_equalweight(df_features, df_resumo["data_decisao"].tolist(), horizonte)
-        df_resumo = df_resumo.merge(df_bench, on="data_decisao", how="left")
-
-    return pd.DataFrame(operacoes), df_resumo
+    return pd.DataFrame(operacoes), pd.DataFrame(resumo)
