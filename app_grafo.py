@@ -5,8 +5,11 @@ Depende só de grafo_estrategia.py + streamlit/pandas. Não importa core.py.
 """
 import pandas as pd
 import streamlit as st
+import itertools
+import time
 
 import grafo_estrategia as ge
+import profiles_manager as pm
 
 st.set_page_config(page_title="Estratégia de Grafo de Correlação (B3)", layout="wide")
 st.title("Estratégia B3 baseada em grafo de correlação")
@@ -36,153 +39,321 @@ with st.expander("Metodologia (o que é isso, tecnicamente)"):
 
 arquivo = st.file_uploader("Arquivo processado (parquet ou csv, saída do b3_cotahist.py)", type=["parquet", "csv"])
 
-col1, col2, col3, col4 = st.columns(4)
-capital = col1.number_input("Capital total (R$)", min_value=0.0, value=100000.0, step=1000.0)
-capital_max_por_acao = col2.number_input("Máximo por ação (R$)", min_value=0.0, value=1000.0, step=100.0)
-horizonte = col3.number_input("Horizonte (pregões à frente)", min_value=1, value=ge.HORIZONTE_PADRAO)
-top_n = col4.number_input("Nº máximo de ativos por período", min_value=1, value=10)
-
-col5, col6 = st.columns(2)
-janela_correlacao = col5.number_input(
-    "Janela de correlação (pregões)", min_value=20, value=ge.JANELA_CORRELACAO_PADRAO, step=10,
-    help="Quantos pregões passados usar para calcular a correlação entre as ações.",
-)
-limiar_correlacao = col6.number_input(
-    "Correlação mínima para virar 'vizinho' no grafo", min_value=0.0, max_value=1.0,
-    value=ge.LIMIAR_CORRELACAO_PADRAO, step=0.05,
-    help="Só cria uma aresta entre duas ações se a correlação (em módulo) for maior que isso.",
-)
-
-st.caption(
-    "Custos e impostos abaixo começam **zerados**. Preencha com os valores da sua corretora "
-    "e da sua situação fiscal; o app não assume nenhum valor por conta própria."
-)
-
-with st.expander("Custos de transação (B3 + corretagem + ISS)"):
-    c1, c2, c3 = st.columns(3)
-    taxa_b3_pct = c1.number_input(
-        "Taxa B3 por operação (%)", min_value=0.0, value=ge.TAXA_B3_PADRAO * 100,
-        step=0.001, format="%.4f",
-        help="Negociação + CCP + TTA, por ponta (compra ou venda). Consulte b3.com.br/tarifas.",
-    )
-    corretagem_fixa = c2.number_input(
-        "Corretagem fixa por ordem (R$)", min_value=0.0, value=ge.CORRETAGEM_PADRAO, step=1.0,
-    )
-    corretagem_percentual = c3.number_input(
-        "Corretagem percentual (%)", min_value=0.0, value=ge.CORRETAGEM_PERCENTUAL_PADRAO * 100,
-        step=0.01, format="%.4f",
-    )
-    iss_pct = st.number_input(
-        "ISS sobre a corretagem (%)", min_value=0.0, value=ge.ISS_PADRAO * 100, step=0.1,
-        help="Imposto municipal (2% a 5% conforme o município). Se a corretagem é zero, o ISS também é.",
-    )
-
-with st.expander("Impostos sobre o resultado (IRRF + IR mensal, regra de swing trade)"):
-    d1, d2, d3 = st.columns(3)
-    irrf_pct = d1.number_input(
-        "IRRF sobre venda / \"dedo-duro\" (%)", min_value=0.0, value=ge.IRRF_PCT_PADRAO * 100,
-        step=0.001, format="%.5f",
-        help="Regra oficial (swing trade): 0,005% sobre a venda, abatido do IR devido no mês.",
-    )
-    ir_aliquota_pct = d2.number_input(
-        "Alíquota de IR sobre o lucro mensal (%)", min_value=0.0, value=ge.IR_ALIQUOTA_PADRAO * 100,
-        step=1.0, help="Regra oficial (swing trade): 15% sobre o ganho líquido do mês.",
-    )
-    isencao_mensal = d3.number_input(
-        "Isenção de IR se vendas do mês ≤ (R$)", min_value=0.0, value=ge.ISENCAO_VENDAS_MENSAL_PADRAO,
-        step=1000.0, help="Regra oficial (swing trade): R$ 20.000/mês em vendas totais.",
-    )
-
-if arquivo and st.button("Carregar dados"):
-    with st.spinner("Carregando dados e calculando retornos..."):
+if arquivo and st.button("Carregar dados global"):
+    with st.spinner("Carregando dados globais..."):
         caminho = f"/tmp/{arquivo.name}"
         with open(caminho, "wb") as f:
             f.write(arquivo.getbuffer())
         df = ge.carregar_dados(caminho)
-        df = ge.construir_features_grafo(df, horizonte=int(horizonte))
+    st.session_state.dados_brutos = df
+    st.success(f"Dados globais carregados: {len(df):,} linhas, {df['ticker'].nunique()} tickers.")
 
-    st.session_state.dados_grafo = dict(
-        df=df, capital=capital, capital_max_por_acao=capital_max_por_acao,
+
+def build_params_ui(key_prefix):
+    """Constrói os widgets de parâmetros e retorna um dict com eles."""
+    defaults = st.session_state.get("loaded_profile_params", {})
+
+    col1, col2, col3, col4 = st.columns(4)
+    capital = col1.number_input("Capital total (R$)", min_value=0.0, value=float(defaults.get("capital", 100000.0)), step=1000.0, key=f"{key_prefix}_cap")
+    capital_max_por_acao = col2.number_input("Máximo por ação (R$)", min_value=0.0, value=float(defaults.get("capital_max_por_acao", 1000.0)), step=100.0, key=f"{key_prefix}_cap_max")
+    horizonte = col3.number_input("Horizonte (pregões à frente)", min_value=1, value=int(defaults.get("horizonte", ge.HORIZONTE_PADRAO)), key=f"{key_prefix}_horiz")
+    top_n = col4.number_input("Nº máximo de ativos por período", min_value=1, value=int(defaults.get("top_n", 10)), key=f"{key_prefix}_topn")
+
+    col5, col6 = st.columns(2)
+    janela_correlacao = col5.number_input(
+        "Janela de correlação (pregões)", min_value=20, value=int(defaults.get("janela_correlacao", ge.JANELA_CORRELACAO_PADRAO)), step=10,
+        help="Quantos pregões passados usar para calcular a correlação entre as ações.", key=f"{key_prefix}_janela_corr"
+    )
+    limiar_correlacao = col6.number_input(
+        "Correlação mínima para virar 'vizinho' no grafo", min_value=0.0, max_value=1.0,
+        value=float(defaults.get("limiar_correlacao", ge.LIMIAR_CORRELACAO_PADRAO)), step=0.05,
+        help="Só cria uma aresta entre duas ações se a correlação (em módulo) for maior que isso.", key=f"{key_prefix}_limiar_corr"
+    )
+
+    st.caption(
+        "Custos e impostos abaixo começam **zerados**. Preencha com os valores da sua corretora "
+        "e da sua situação fiscal; o app não assume nenhum valor por conta própria."
+    )
+    with st.expander("Custos de transação (B3 + corretagem + ISS)"):
+        c1, c2, c3 = st.columns(3)
+        taxa_b3_pct = c1.number_input(
+            "Taxa B3 por operação (%)", min_value=0.0, value=float(defaults.get("taxa_b3", ge.TAXA_B3_PADRAO)) * 100.0,
+            step=0.001, format="%.4f", key=f"{key_prefix}_tb3",
+            help="Negociação + CCP + TTA, por ponta (compra ou venda). Consulte b3.com.br/tarifas."
+        )
+        corretagem_fixa = c2.number_input(
+            "Corretagem fixa por ordem (R$)", min_value=0.0, value=float(defaults.get("corretagem_fixa", ge.CORRETAGEM_PADRAO)),
+            step=1.0, key=f"{key_prefix}_cf"
+        )
+        corretagem_percentual = c3.number_input(
+            "Corretagem percentual (%)", min_value=0.0, value=float(defaults.get("corretagem_percentual", ge.CORRETAGEM_PERCENTUAL_PADRAO)) * 100.0,
+            step=0.01, format="%.4f", key=f"{key_prefix}_cp"
+        )
+        iss_pct = st.number_input(
+            "ISS sobre a corretagem (%)", min_value=0.0, value=float(defaults.get("iss_pct", ge.ISS_PADRAO)) * 100.0,
+            step=0.1, key=f"{key_prefix}_iss",
+            help="Imposto municipal (2% a 5% conforme o município). Se a corretagem é zero, o ISS também é."
+        )
+        
+    with st.expander("Impostos sobre o resultado (IRRF + IR mensal, regra de swing trade)"):
+        d1, d2, d3 = st.columns(3)
+        irrf_pct = d1.number_input(
+            "IRRF sobre venda / \"dedo-duro\" (%)", min_value=0.0, value=float(defaults.get("irrf_pct", ge.IRRF_PCT_PADRAO)) * 100.0,
+            step=0.001, format="%.5f", key=f"{key_prefix}_irrf",
+            help="Regra oficial (swing trade): 0,005% sobre a venda, abatido do IR devido no mês."
+        )
+        ir_aliquota_pct = d2.number_input(
+            "Alíquota de IR sobre o lucro mensal (%)", min_value=0.0, value=float(defaults.get("ir_aliquota", ge.IR_ALIQUOTA_PADRAO)) * 100.0,
+            step=1.0, key=f"{key_prefix}_iraliq",
+            help="Regra oficial (swing trade): 15% sobre o ganho líquido do mês."
+        )
+        isencao_mensal = d3.number_input(
+            "Isenção de IR se vendas do mês ≤ (R$)", min_value=0.0, value=float(defaults.get("isencao_mensal", ge.ISENCAO_VENDAS_MENSAL_PADRAO)),
+            step=1000.0, key=f"{key_prefix}_isenc_ir",
+            help="Regra oficial (swing trade): R$ 20.000/mês em vendas totais."
+        )
+
+    return dict(
+        capital=capital, capital_max_por_acao=capital_max_por_acao,
         horizonte=int(horizonte), top_n=int(top_n),
         janela_correlacao=int(janela_correlacao), limiar_correlacao=limiar_correlacao,
-        taxa_b3=taxa_b3_pct / 100, corretagem_fixa=corretagem_fixa,
-        corretagem_percentual=corretagem_percentual / 100, iss_pct=iss_pct / 100,
-        irrf_pct=irrf_pct / 100, ir_aliquota=ir_aliquota_pct / 100,
-        isencao_mensal=isencao_mensal,
+        taxa_b3=taxa_b3_pct / 100.0, corretagem_fixa=corretagem_fixa,
+        corretagem_percentual=corretagem_percentual / 100.0, iss_pct=iss_pct / 100.0,
+        irrf_pct=irrf_pct / 100.0, ir_aliquota=ir_aliquota_pct / 100.0,
+        isencao_mensal=isencao_mensal
     )
-    st.success(f"Dados carregados: {len(df):,} linhas, {df['ticker'].nunique()} tickers.")
 
-if "dados_grafo" in st.session_state:
-    d = st.session_state.dados_grafo
-    df = d["df"]
+
+tab_indiv, tab_comp = st.tabs(["📊 Backtest e Profiles", "🏆 Comparativo Lote"])
+
+# ----------------- ABA 1: BACKTEST E PROFILES -----------------
+with tab_indiv:
+    st.markdown("### Configuração, Simulação e Salvamento de Profiles")
+    st.write("Configure os parâmetros abaixo para executar um laboratório rápido nesta aba ou salvar no seu banco de dados para comparativo em lote na Aba ao lado.")
+
+    st.markdown("#### ⚙️ Gerenciamento de Profiles")
+    perfis_salvos = pm.load_profiles()
+    
+    col_load, col_save = st.container().columns(2)
+    st.divider()
+    
+    # Renderiza o form
+    d_indiv = build_params_ui("indiv")
+    
+    # Preenche o top com col_load
+    with col_load:
+        st.markdown("**📥 Carregar / Deletar Profiles**")
+        p_load = st.selectbox("Selecione um profile:", ["-- Novo / Padrão --"] + list(perfis_salvos.keys()))
+        
+        def _carregar_profile(nome):
+            if nome != "-- Novo / Padrão --":
+                params = perfis_salvos[nome]
+                st.session_state["loaded_profile_params"] = params
+                
+                st.session_state["indiv_cap"] = float(params.get("capital", 100000.0))
+                st.session_state["indiv_cap_max"] = float(params.get("capital_max_por_acao", 1000.0))
+                st.session_state["indiv_horiz"] = int(params.get("horizonte", ge.HORIZONTE_PADRAO))
+                st.session_state["indiv_topn"] = int(params.get("top_n", 10))
+                st.session_state["indiv_janela_corr"] = int(params.get("janela_correlacao", ge.JANELA_CORRELACAO_PADRAO))
+                st.session_state["indiv_limiar_corr"] = float(params.get("limiar_correlacao", ge.LIMIAR_CORRELACAO_PADRAO))
+                st.session_state["indiv_tb3"] = float(params.get("taxa_b3", ge.TAXA_B3_PADRAO)) * 100.0
+                st.session_state["indiv_cf"] = float(params.get("corretagem_fixa", ge.CORRETAGEM_PADRAO))
+                st.session_state["indiv_cp"] = float(params.get("corretagem_percentual", ge.CORRETAGEM_PERCENTUAL_PADRAO)) * 100.0
+                st.session_state["indiv_iss"] = float(params.get("iss_pct", ge.ISS_PADRAO)) * 100.0
+                st.session_state["indiv_irrf"] = float(params.get("irrf_pct", ge.IRRF_PCT_PADRAO)) * 100.0
+                st.session_state["indiv_iraliq"] = float(params.get("ir_aliquota", ge.IR_ALIQUOTA_PADRAO)) * 100.0
+                st.session_state["indiv_isenc_ir"] = float(params.get("isencao_mensal", ge.ISENCAO_VENDAS_MENSAL_PADRAO))
+
+        def _resetar_padrao():
+            if "loaded_profile_params" in st.session_state:
+                del st.session_state["loaded_profile_params"]
+            for k in list(st.session_state.keys()):
+                if k.startswith("indiv_"):
+                    del st.session_state[k]
+
+        c_btn, c_clear, c_del = st.columns(3)
+        
+        if c_btn.button("📥 Carregar", use_container_width=True, on_click=_carregar_profile, args=(p_load,)):
+            if p_load == "-- Novo / Padrão --":
+                st.warning("Selecione um profile válido para carregar.")
+                
+        c_clear.button("🔄 Padrão", use_container_width=True, on_click=_resetar_padrao)
+            
+        if c_del.button("🗑️ Deletar Atual", use_container_width=True):
+            if p_load != "-- Novo / Padrão --":
+                pm.delete_profile(p_load)
+                st.success("Deletado!")
+                st.rerun()
+            else:
+                st.warning("Selecione um profile na lista para deletar.")
+
+    with col_save:
+        st.markdown("**💾 Salvar Configurações (Lote)**")
+        nome_profile = st.text_input("Dê um nome para salvar a config atual:")
+        if st.button("💾 Salvar Profile Atual no Banco de Dados", use_container_width=True):
+            if nome_profile.strip():
+                sucesso = pm.save_profile(nome_profile.strip(), d_indiv)
+                if sucesso:
+                    st.success(f"Profile salvo!")
+                    st.rerun()
+            else:
+                st.warning("Insira um nome válido antes de clicar em salvar.")
+
 
     st.divider()
-    st.subheader("Backtest")
+    
+    st.markdown("#### 🚀 Rodar Teste Rápido (Somente Tela)")
+    if "dados_brutos" in st.session_state:
+        df_base = st.session_state.dados_brutos
+        data_min = pd.Timestamp(df_base["data_pregao"].min()).date()
+        data_max = pd.Timestamp(df_base["data_pregao"].max()).date()
 
-    modo_periodo = st.radio(
-        "Período a simular", ["Histórico completo", "Um dia específico", "Intervalo de datas"],
-        horizontal=True,
-    )
-    data_min = pd.Timestamp(df["data_pregao"].min()).date()
-    data_max = pd.Timestamp(df["data_pregao"].max()).date()
-    data_inicio = data_fim = None
-    if modo_periodo == "Um dia específico":
-        dia = st.date_input("Data da decisão de compra", value=data_max, min_value=data_min, max_value=data_max)
-        data_inicio = data_fim = dia
-    elif modo_periodo == "Intervalo de datas":
-        intervalo = st.date_input(
-            "Intervalo de datas de decisão", value=(data_min, data_max),
-            min_value=data_min, max_value=data_max,
-        )
-        if isinstance(intervalo, tuple) and len(intervalo) == 2:
-            data_inicio, data_fim = intervalo
-        else:
-            st.info("Selecione a data final do intervalo para continuar.")
+        modo_periodo = st.radio("Período a simular", ["Histórico completo", "Um dia específico", "Intervalo de datas"], horizontal=True, key="modo_per_ind")
+        data_inicio = data_fim = None
+        if modo_periodo == "Um dia específico":
+            dia = st.date_input("Data da decisão", value=data_max, min_value=data_min, max_value=data_max, key="dia_ind")
+            data_inicio = data_fim = dia
+        elif modo_periodo == "Intervalo de datas":
+            intervalo = st.date_input("Intervalo de datas", value=(data_min, data_max), min_value=data_min, max_value=data_max, key="int_ind")
+            if isinstance(intervalo, tuple) and len(intervalo) == 2:
+                data_inicio, data_fim = intervalo
 
-    if st.button("Rodar backtest"):
-        with st.spinner("Construindo grafos de correlação e simulando..."):
-            operacoes, resumo = ge.backtest_grafo(
-                df, capital_total=d["capital"], capital_max_por_acao=d["capital_max_por_acao"],
-                horizonte=d["horizonte"], top_n=d["top_n"],
-                taxa_b3=d["taxa_b3"], corretagem_fixa=d["corretagem_fixa"],
-                corretagem_percentual=d["corretagem_percentual"], iss_pct=d["iss_pct"],
-                irrf_pct=d["irrf_pct"], janela_correlacao=d["janela_correlacao"],
-                limiar_correlacao=d["limiar_correlacao"], data_inicio=data_inicio, data_fim=data_fim,
-            )
-            ir_mensal = ge.calcular_ir_mensal(
-                operacoes, ir_aliquota=d["ir_aliquota"], isencao_vendas_mensal=d["isencao_mensal"]
-            )
-            st.session_state.resultado_backtest_grafo = (operacoes, resumo, ir_mensal, d["capital"])
+        if st.button("Executar Simulação Única"):
+            if modo_periodo == "Histórico completo" or not isinstance(data_inicio, type(None)):
+                t0 = time.perf_counter()
+                with st.spinner("Construindo grafo e executando..."):
+                    df_calc = ge.construir_features_grafo(df_base.copy(), horizonte=d_indiv["horizonte"])
+                    operacoes, resumo = ge.backtest_grafo(
+                        df_calc, capital_total=d_indiv["capital"], capital_max_por_acao=d_indiv["capital_max_por_acao"],
+                        horizonte=d_indiv["horizonte"], top_n=d_indiv["top_n"],
+                        taxa_b3=d_indiv["taxa_b3"], corretagem_fixa=d_indiv["corretagem_fixa"],
+                        corretagem_percentual=d_indiv["corretagem_percentual"], iss_pct=d_indiv["iss_pct"],
+                        irrf_pct=d_indiv["irrf_pct"], janela_correlacao=d_indiv["janela_correlacao"],
+                        limiar_correlacao=d_indiv["limiar_correlacao"], data_inicio=data_inicio, data_fim=data_fim,
+                    )
+                    ir_mensal = ge.calcular_ir_mensal(operacoes, ir_aliquota=d_indiv["ir_aliquota"], isencao_vendas_mensal=d_indiv["isencao_mensal"])
+                t1 = time.perf_counter()
+                tempo_execucao = t1 - t0
+                    
+                if resumo.empty:
+                    st.info("Nenhum dado neste intervalo.")
+                else:
+                    cfb = resumo["capital_apos_periodo"].iloc[-1]
+                    darf = ir_mensal["darf_a_pagar"].sum() if not ir_mensal.empty else 0.0
+                    cflip = cfb - darf
+                    st.metric("Capital Líquido Final", f"R$ {cflip:,.2f}", f"{(cflip/d_indiv['capital']-1)*100:.2f}%")
+                    st.caption(f"⏱️ Tempo total de execução: {tempo_execucao:.3f}s")
+                    
+                    st.line_chart(resumo.set_index("data_decisao")["capital_apos_periodo"])
+                    
+                    st.subheader("Resumo por período")
+                    st.dataframe(resumo, use_container_width=True)
 
-    if "resultado_backtest_grafo" in st.session_state:
-        operacoes, resumo, ir_mensal, capital_inicial = st.session_state.resultado_backtest_grafo
-        if resumo.empty:
-            st.info("Nenhum período simulável com esses parâmetros (janela de correlação ou período curtos demais).")
-        else:
-            capital_final_bruto = resumo["capital_apos_periodo"].iloc[-1]
-            total_darf = ir_mensal["darf_a_pagar"].sum() if not ir_mensal.empty else 0.0
-            capital_final_liquido = capital_final_bruto - total_darf
+                    st.subheader("Apuração de IR mensal (DARF)")
+                    if ir_mensal.empty:
+                        st.info("Nenhuma venda com data suficiente para apurar IR mensal.")
+                    else:
+                        st.dataframe(ir_mensal, use_container_width=True)
 
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Capital final (antes de IR)", f"R$ {capital_final_bruto:,.2f}",
-                      f"{(capital_final_bruto/capital_inicial-1)*100:.2f}%")
-            m2.metric("DARF total pago no período", f"R$ {total_darf:,.2f}")
-            m3.metric("Capital final (líquido de IR)", f"R$ {capital_final_liquido:,.2f}",
-                      f"{(capital_final_liquido/capital_inicial-1)*100:.2f}%")
+                    st.subheader("Todas as operações simuladas")
+                    st.dataframe(operacoes, use_container_width=True)
+    else:
+        st.info("Carregue os dados globais no topo da página primeiro.")
 
-            periodos_positivos = float((resumo["lucro_periodo"] > 0).mean())
-            st.caption(f"Períodos com lucro operacional positivo: {periodos_positivos:.1%} de {len(resumo)} decisões.")
 
-            st.line_chart(resumo.set_index("data_decisao")["capital_apos_periodo"])
+# ----------------- ABA 3: COMPARATIVO LOTE -----------------
+with tab_comp:
+    st.markdown("### Execução e Comparativo de Lote")
+    perfis_salvos = pm.load_profiles()
+    
+    if "dados_brutos" not in st.session_state:
+        st.info("Carregue os dados globais no topo da página primeiro.")
+    elif not perfis_salvos:
+        st.info("Você precisa salvar profiles na Aba 1 antes de executar o comparativo.")
+    else:
+        df_base = st.session_state.dados_brutos
+        data_min = pd.Timestamp(df_base["data_pregao"].min()).date()
+        data_max = pd.Timestamp(df_base["data_pregao"].max()).date()
+        
+        c1, c2 = st.columns(2)
+        profiles_selecionados = c1.multiselect("Selecione os profiles para rodar", list(perfis_salvos.keys()), default=list(perfis_salvos.keys()))
+        data_i, data_f = c2.date_input("Intervalo de datas do Lote", value=(data_min, data_max), min_value=data_min, max_value=data_max)
 
-            st.subheader("Resumo por período")
-            st.dataframe(resumo, use_container_width=True)
-
-            st.subheader("Apuração de IR mensal (DARF)")
-            if ir_mensal.empty:
-                st.info("Nenhuma venda com data suficiente para apurar IR mensal.")
+        if st.button("Executar Comparativo 🚀"):
+            if len(profiles_selecionados) == 0:
+                st.warning("Selecione no mínimo 1 profile.")
             else:
-                st.dataframe(ir_mensal, use_container_width=True)
-
-            st.subheader("Todas as operações simuladas")
-            st.dataframe(operacoes, use_container_width=True)
+                try:
+                    resultados_resumo = []
+                    linhas_rank = []
+                    
+                    barra = st.progress(0, text="Preparando dados base...")
+                    total_p = len(profiles_selecionados)
+                    
+                    df_calc_cache = {}
+                    t0_lote = time.perf_counter()
+                    
+                    for idx, p_name in enumerate(profiles_selecionados):
+                        barra.progress(idx / total_p, text=f"Executando {p_name} ({idx+1}/{total_p})...")
+                        p_params = perfis_salvos[p_name]
+                        
+                        t0_profile = time.perf_counter()
+                        
+                        horizont = p_params["horizonte"]
+                        if horizont not in df_calc_cache:
+                            df_calc_cache[horizont] = ge.construir_features_grafo(df_base.copy(), horizonte=horizont)
+                        df_calc = df_calc_cache[horizont]
+                        
+                        operacoes, resumo = ge.backtest_grafo(
+                            df_calc, capital_total=p_params["capital"], capital_max_por_acao=p_params["capital_max_por_acao"],
+                            horizonte=p_params["horizonte"], top_n=p_params["top_n"],
+                            taxa_b3=p_params["taxa_b3"], corretagem_fixa=p_params["corretagem_fixa"],
+                            corretagem_percentual=p_params["corretagem_percentual"], iss_pct=p_params["iss_pct"],
+                            irrf_pct=p_params["irrf_pct"], janela_correlacao=p_params["janela_correlacao"],
+                            limiar_correlacao=p_params["limiar_correlacao"], data_inicio=data_i, data_fim=data_f,
+                        )
+                        
+                        t1_profile = time.perf_counter()
+                        tempo_profile = t1_profile - t0_profile
+                        
+                        if not resumo.empty:
+                            ir_mensal = ge.calcular_ir_mensal(operacoes, ir_aliquota=p_params["ir_aliquota"], isencao_vendas_mensal=p_params["isencao_mensal"])
+                            cfb = resumo["capital_apos_periodo"].iloc[-1]
+                            darf = ir_mensal["darf_a_pagar"].sum() if not ir_mensal.empty else 0.0
+                            cflip = cfb - darf
+                            lucro_pct = (cflip / p_params["capital"] - 1) * 100
+                            
+                            win_rate = (resumo["lucro_periodo"] > 0).mean() * 100
+                            max_dd = resumo["capital_apos_periodo"].min() - p_params["capital"] # Simplificado
+                            num_trades = len(operacoes)
+                            
+                            linhas_rank.append({
+                                "Profile": p_name,
+                                "Capital Final Líq (R$)": round(cflip, 2),
+                                "Retorno (%)": round(lucro_pct, 2),
+                                "Imposto Pago (R$)": round(darf, 2),
+                                "Taxa de Acerto (%)": round(win_rate, 2),
+                                "Total de Trades": num_trades,
+                                "Tempo (s)": round(tempo_profile, 3)
+                            })
+                            
+                            resumo["Profile"] = p_name
+                            resultados_resumo.append(resumo)
+                    
+                    t1_lote = time.perf_counter()
+                    tempo_total_lote = t1_lote - t0_lote
+                    barra.progress(1.0, text=f"Processamento concluído em {tempo_total_lote:.3f}s.")
+                    
+                    st.divider()
+                    st.subheader("🏆 Ranking de Desempenho")
+                    df_rank = pd.DataFrame(linhas_rank).sort_values("Retorno (%)", ascending=False)
+                    st.dataframe(df_rank, use_container_width=True)
+                    
+                    st.subheader("📈 Curvas de Patrimônio (Equity Curves)")
+                    if resultados_resumo:
+                        df_grafico = pd.concat(resultados_resumo)
+                        pivoted = df_grafico.pivot(index="data_decisao", columns="Profile", values="capital_apos_periodo").fillna(method="ffill")
+                        st.line_chart(pivoted)
+                        
+                except Exception as e:
+                    st.error(f"Erro na execução em lote: {e}")

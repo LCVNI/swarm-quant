@@ -1,0 +1,17 @@
+{
+    "CG_C1": {
+        "capital": 100000.0,
+        "capital_max_por_acao": 1000.0,
+        "horizonte": 5,
+        "top_n": 10,
+        "janela_correlacao": 60,
+        "limiar_correlacao": 0.3,
+        "taxa_b3": 0.000325,
+        "corretagem_fixa": 0.0,
+        "corretagem_percentual": 0.0,
+        "iss_pct": 0.0,
+        "irrf_pct": 5e-05,
+        "ir_aliquota": 0.15,
+        "isencao_mensal": 20000.0
+    }
+}
