@@ -16,10 +16,14 @@ Regra de decisão (lead-lag / contágio de retorno): para cada ticker, calcula
 o retorno médio recente dos vizinhos no grafo, ponderado pela correlação, e
 compara com o retorno recente do próprio ticker. Sinal alto = vizinhos
 correlacionados já subiram, o ticker ainda não acompanhou.
+
+OTIMIZAÇÃO v2 (Fases A+B do plano_otimizacao_performance.md):
+  - Fase A: Substituição do loop O(N²) Python por máscaras booleanas NumPy.
+  - Fase B: Instanciação direta no iGraph (C-Core), eliminando o NetworkX
+    do hot path. Pipe: NumPy → iGraph → leidenalg. Sem ponte de tradução.
 """
 from __future__ import annotations
 
-import networkx as nx
 import numpy as np
 import pandas as pd
 
@@ -69,55 +73,147 @@ def _pivot_retornos(df: pd.DataFrame, coluna: str = "retorno_1d") -> pd.DataFram
 
 
 # ---------------------------------------------------------------------------
-# Grafo e sinal
+# Grafo e sinal — PIPELINE OTIMIZADO (NumPy → iGraph → Leiden)
 # ---------------------------------------------------------------------------
 def construir_grafo_correlacao(
     retornos_pivot: pd.DataFrame,
     data_referencia: pd.Timestamp,
     janela: int = JANELA_CORRELACAO_PADRAO,
     limiar_correlacao: float = LIMIAR_CORRELACAO_PADRAO,
-) -> nx.Graph:
-    """Grafo de correlação usando só dados ANTERIORES a `data_referencia` (sem vazamento)."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Constrói as arestas do grafo de correlação via máscaras NumPy vetorizadas.
+
+    FASE A da otimização: elimina o loop duplo O(N²) em Python puro.
+    Retorna uma tupla (tickers, indices_row, indices_col, pesos) onde:
+      - tickers: array de strings com os nomes dos tickers (nós do grafo)
+      - indices_row, indices_col: arrays de inteiros com as coordenadas das arestas
+      - pesos: array de floats com os pesos (correlações) de cada aresta
+
+    Usa somente dados ANTERIORES a `data_referencia` (sem vazamento).
+    """
     janela_dados = retornos_pivot[retornos_pivot.index < data_referencia].tail(janela)
-    grafo = nx.Graph()
-    if len(janela_dados) < max(20, janela // 3):
-        return grafo
+    min_periodos = max(20, janela // 3)
 
-    corr = janela_dados.corr(min_periods=max(20, janela // 3))
-    grafo.add_nodes_from(corr.columns)
-    colunas = list(corr.columns)
-    for i, t1 in enumerate(colunas):
-        for t2 in colunas[i + 1:]:
-            peso = corr.loc[t1, t2]
-            if pd.notna(peso) and abs(peso) >= limiar_correlacao:
-                grafo.add_edge(t1, t2, weight=float(peso))
-    return grafo
+    if len(janela_dados) < min_periodos:
+        return np.array([]), np.array([], dtype=int), np.array([], dtype=int), np.array([])
+
+    corr = janela_dados.corr(min_periods=min_periodos)
+    tickers = corr.columns.values  # array numpy de strings
+
+    # --- FASE A: Máscara Booleana Trigonal (NumPy C-Core) ---
+    matriz = corr.values.copy()
+    np.fill_diagonal(matriz, np.nan)  # Remove autocorrelação (diagonal = 1.0)
+
+    # Máscara triangular superior: evita contar arestas em dobro (A-B e B-A)
+    mask_triu = np.triu(np.ones(matriz.shape, dtype=bool), k=1)
+
+    # Máscara de validade: passou do limiar E não é NaN
+    mask_valida = (np.abs(matriz) >= limiar_correlacao) & mask_triu & ~np.isnan(matriz)
+
+    # Extrai coordenadas e pesos instantaneamente (sem loop For)
+    indices_row, indices_col = np.where(mask_valida)
+    pesos = np.abs(matriz[indices_row, indices_col])  # abs(): Leiden exige pesos positivos
+
+    return tickers, indices_row, indices_col, pesos
 
 
-def calcular_sinal_grafo(grafo: nx.Graph, retornos_recentes: pd.Series) -> pd.DataFrame:
-    """`retornos_recentes`: Series ticker -> retorno recente (ex: retorno_5d) na data de decisão."""
+def detectar_comunidades_leiden(
+    tickers: np.ndarray,
+    indices_row: np.ndarray,
+    indices_col: np.ndarray,
+    pesos: np.ndarray,
+) -> tuple[dict, float, int]:
+    """Detecta comunidades via Leiden diretamente no iGraph (C-Core).
+
+    FASE B da otimização: instancia o grafo diretamente no iGraph usando
+    TupleList, eliminando completamente o NetworkX e a ponte from_networkx().
+    Pipe: NumPy arrays → iGraph.TupleList (C) → leidenalg (C++).
+
+    Retorna: dicionario {ticker: cluster_id}, modularidade Q, e numero de clusters.
+    """
+    try:
+        import igraph as ig
+        import leidenalg
+    except ImportError:
+        raise ImportError("Por favor instale as bibliotecas 'igraph' e 'leidenalg' para detecção de comunidades.")
+
+    if len(tickers) <= 1 or len(pesos) == 0:
+        return {t: 0 for t in tickers}, 0.0, 1
+
+    # --- FASE B: Instanciação direta no iGraph (sem NetworkX) ---
+    # Mapeia índices numéricos de volta para nomes de tickers
+    tickers_row = tickers[indices_row]
+    tickers_col = tickers[indices_col]
+
+    # Empacota em tuplas e injeta direto na engine C do iGraph
+    arestas_com_pesos = list(zip(tickers_row, tickers_col, pesos))
+    g_ig = ig.Graph.TupleList(arestas_com_pesos, weights=True)
+
+    # Garante que nós isolados (sem arestas) entrem no grafo
+    nomes_no_grafo = set(g_ig.vs["name"])
+    nomes_faltantes = [t for t in tickers if t not in nomes_no_grafo]
+    if nomes_faltantes:
+        g_ig.add_vertices(nomes_faltantes)
+
+    # Extrai pesos das arestas para o Leiden
+    weights = g_ig.es['weight'] if g_ig.ecount() > 0 and 'weight' in g_ig.edge_attributes() else None
+
+    partition = leidenalg.find_partition(
+        g_ig,
+        leidenalg.ModularityVertexPartition,
+        weights=weights
+    )
+
+    mapeamento = {nome: cluster for nome, cluster in zip(g_ig.vs['name'], partition.membership)}
+    q = partition.modularity
+    n_clusters = len(partition)
+
+    return mapeamento, q, n_clusters
+
+
+def calcular_sinal_grafo(
+    tickers_grafo: np.ndarray,
+    retornos_recentes: pd.Series,
+    mapeamento_leiden: dict,
+) -> pd.DataFrame:
+    """Calcula o sinal de spillover baseado nos clusters Leiden.
+
+    O spillover subtrai a performance da Ação contra a do seu Macro-Cluster inteiro.
+    Recebe a lista de tickers do grafo (array NumPy) ao invés de um objeto NetworkX.
+    """
     linhas = []
-    for ticker in grafo.nodes:
+
+    # Pre-agrega retornos válidos de cada cluster
+    retornos_por_cluster: dict[int, list[float]] = {}
+    for ticker, cluster_id in mapeamento_leiden.items():
+        if ticker in retornos_recentes.index and pd.notna(retornos_recentes.get(ticker)):
+            if cluster_id not in retornos_por_cluster:
+                retornos_por_cluster[cluster_id] = []
+            retornos_por_cluster[cluster_id].append(retornos_recentes[ticker])
+
+    for ticker in tickers_grafo:
         if ticker not in retornos_recentes.index or pd.isna(retornos_recentes.get(ticker)):
             continue
-        vizinhos = list(grafo.neighbors(ticker))
-        if not vizinhos:
+
+        cluster_do_ticker = mapeamento_leiden.get(ticker)
+        if cluster_do_ticker is None or cluster_do_ticker not in retornos_por_cluster:
             continue
 
-        pesos, retornos_viz = [], []
-        for v in vizinhos:
-            r = retornos_recentes.get(v, np.nan)
-            if pd.notna(r):
-                pesos.append(abs(grafo[ticker][v]["weight"]))
-                retornos_viz.append(r)
-        if not pesos or sum(pesos) == 0:
-            continue
+        # Pega a "família" da ação (o continente Leiden)
+        retornos_do_silo = list(retornos_por_cluster[cluster_do_ticker])
+        r_proprio = retornos_recentes[ticker]
 
-        media_vizinhos = float(np.average(retornos_viz, weights=pesos))
-        retorno_proprio = float(retornos_recentes[ticker])
+        # Remove a própria ação pra não poluir a média dos "outros"
+        if len(retornos_do_silo) > 1:
+            retornos_do_silo.remove(r_proprio)
+            media_vizinhos = float(np.average(retornos_do_silo))
+        else:
+            continue  # Se for um cluster de 1 nó isolado, não há sinal estrutural
+
+        retorno_proprio = float(r_proprio)
         linhas.append({
             "ticker": ticker,
-            "grau": len(vizinhos),
+            "grau": len(retornos_do_silo),  # Grau agora significa 'tamanho do cluster vizinho'
             "retorno_vizinhos": round(media_vizinhos, 4),
             "retorno_proprio": round(retorno_proprio, 4),
             "sinal_spillover": round(media_vizinhos - retorno_proprio, 4),
@@ -229,7 +325,11 @@ def backtest_grafo(
     com passado), calcula o sinal de spillover, compra os top_n com sinal
     positivo o suficiente pra cobrir custos, mantém `horizonte` pregões e
     realiza com o retorno real (`retorno_futuro`).
+
+    OTIMIZADO v2: Pipeline NumPy → iGraph → Leiden (sem NetworkX no loop).
     """
+    import time as _time  # Profiler temporário
+
     base = df_features.dropna(subset=["retorno_1d", "retorno_5d", "retorno_futuro"]).copy()
     datas = np.sort(base["data_pregao"].unique())
     retornos_pivot = _pivot_retornos(df_features)
@@ -238,6 +338,13 @@ def backtest_grafo(
     capital_disponivel = capital_total
     operacoes = []
     resumo = []
+
+    # --- PROFILER: acumuladores de tempo por etapa ---
+    _t_corr = 0.0
+    _t_leiden = 0.0
+    _t_sinal = 0.0
+    _t_alocacao = 0.0
+    _n_iteracoes = 0
 
     i = min_dias_treino
     if data_inicio is not None:
@@ -250,18 +357,39 @@ def backtest_grafo(
             break
 
         candidatos_dia = base[base["data_pregao"] == data_decisao]
-        grafo = construir_grafo_correlacao(retornos_pivot, data_decisao, janela_correlacao, limiar_correlacao)
-        if grafo.number_of_edges() == 0 or candidatos_dia.empty:
+
+        # --- ETAPA 1: Construção do Grafo (Correlação + NumPy) ---
+        _t0 = _time.perf_counter()
+        tickers, idx_row, idx_col, pesos = construir_grafo_correlacao(
+            retornos_pivot, data_decisao, janela_correlacao, limiar_correlacao
+        )
+        n_arestas = len(pesos)
+        _t_corr += _time.perf_counter() - _t0
+
+        if n_arestas == 0 or candidatos_dia.empty:
             i += horizonte
             continue
 
+        # --- ETAPA 2: Detecção de Comunidades (iGraph + Leiden) ---
+        _t0 = _time.perf_counter()
+        mapeamento_leiden, Q, n_clusters = detectar_comunidades_leiden(
+            tickers, idx_row, idx_col, pesos
+        )
+        _t_leiden += _time.perf_counter() - _t0
+
+        # --- ETAPA 3: Cálculo do Sinal Spillover ---
+        _t0 = _time.perf_counter()
         retornos_recentes = candidatos_dia.set_index("ticker")["retorno_5d"]
-        sinal = calcular_sinal_grafo(grafo, retornos_recentes)
+        sinal = calcular_sinal_grafo(tickers, retornos_recentes, mapeamento_leiden)
         sinal = sinal[sinal["sinal_spillover"] > custo_pct_ida_volta].head(top_n)
+        _t_sinal += _time.perf_counter() - _t0
+
         if sinal.empty:
             i += horizonte
             continue
 
+        # --- ETAPA 4: Alocação e Contabilização ---
+        _t0 = _time.perf_counter()
         candidatos = candidatos_dia.merge(sinal, on="ticker").sort_values("sinal_spillover", ascending=False)
         selecionados = _alocar_greedy(candidatos, capital_disponivel, capital_max_por_acao)
         data_venda = pd.Timestamp(datas[i + horizonte]) if i + horizonte < len(datas) else pd.NaT
@@ -294,16 +422,34 @@ def backtest_grafo(
                 "irrf": round(irrf, 2),
                 "lucro": round(lucro, 2),
             })
+        _t_alocacao += _time.perf_counter() - _t0
 
         capital_disponivel += lucro_periodo
+        _n_iteracoes += 1
         resumo.append({
             "data_decisao": pd.Timestamp(data_decisao).date(),
             "data_venda_prevista": data_venda.date() if pd.notna(data_venda) else None,
             "n_operacoes": len(selecionados),
-            "n_arestas_grafo": grafo.number_of_edges(),
+            "n_arestas_grafo": n_arestas,
+            "leiden_qtd_clusters": n_clusters,
+            "leiden_modularidade": round(Q, 4),
             "lucro_periodo": round(lucro_periodo, 2),
             "capital_apos_periodo": round(capital_disponivel, 2),
         })
         i += horizonte
+
+    # --- PROFILER: Relatório Final ---
+    _t_total = _t_corr + _t_leiden + _t_sinal + _t_alocacao
+    print(f"\n{'='*60}")
+    print(f"  PROFILER DE PERFORMANCE — {_n_iteracoes} iterações")
+    print(f"{'='*60}")
+    print(f"  Correlação + NumPy mask : {_t_corr:8.3f}s  ({_t_corr/_t_total*100:5.1f}%)" if _t_total > 0 else "")
+    print(f"  iGraph + Leiden         : {_t_leiden:8.3f}s  ({_t_leiden/_t_total*100:5.1f}%)" if _t_total > 0 else "")
+    print(f"  Sinal Spillover         : {_t_sinal:8.3f}s  ({_t_sinal/_t_total*100:5.1f}%)" if _t_total > 0 else "")
+    print(f"  Alocação + Contabil.    : {_t_alocacao:8.3f}s  ({_t_alocacao/_t_total*100:5.1f}%)" if _t_total > 0 else "")
+    print(f"{'─'*60}")
+    print(f"  TOTAL PIPELINE          : {_t_total:8.3f}s")
+    print(f"  Média por iteração      : {_t_total/_n_iteracoes*1000:8.1f}ms" if _n_iteracoes > 0 else "")
+    print(f"{'='*60}\n")
 
     return pd.DataFrame(operacoes), pd.DataFrame(resumo)

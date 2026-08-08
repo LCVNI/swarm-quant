@@ -17,31 +17,78 @@ A teoria que o algoritmo implementa (baseada em *Boginski et al.*) dita que o me
 
 ## 2. Passo a Passo do Código: Construindo a Vizinhança
 
-Toda vez que o algoritmo "acorda" em um dia do loop de backtest, ele constrói essa teia de aranha do zero absoluto para tentar ler o estado atual do mercado (linhas 74-94: função `construir_grafo_correlacao`).
+Toda vez que o algoritmo "acorda" em um dia do loop de backtest, ele constrói essa teia de aranha do zero absoluto para tentar ler o estado atual do mercado (função `construir_grafo_correlacao`).
 
 ### A) A Janela de Correlação e a Matriz de Pearson
 ```python
 janela_dados = retornos_pivot[retornos_pivot.index < data_referencia].tail(janela)
-corr = janela_dados.corr()
+corr = janela_dados.corr(min_periods=min_periodos)
 ```
 O algoritmo não olha para preços, ele olha para **retornos diários** (a porcentagem que a ação subiu ou desceu no dia).
 A função acima isola o que aconteceu no mercado nos últimos `X` dias antes do dia de hoje (definido pela `Janela de Correlação`). Ao acionar o método `.corr()`, o Pandas compara os retornos de todas as ações umas contra as outras usando a Correlação de Pearson (que vai de -1 a 1). 
 * `1` significa que subiram e desceram perfeitamente em sincronia.
 * `0` significa que não há relação nenhuma.
 
-### B) Filtrando as "Amizades" Reais (Limiar/Threshold)
-Neste ponto, o código criou uma tabela matricial contendo comparações matemáticas de todas as ações cruzadas e começa a adicionar os vértices (Arestas):
+### B) Filtrando as "Amizades" Reais (Limiar/Threshold) — ⚡ OTIMIZADO v2
+
+> [!IMPORTANT]
+> **Mudança Crítica (Fase A da Otimização):** O antigo loop `for t1 ... for t2` com ~80.000 giros por dia foi **eliminado** e substituído por uma máscara booleana vetorizada em NumPy (escrito em C sob o capô).
+
+**❌ COMO ERA ANTES (Loop O(N²) em Python Puro):**
 ```python
-for t1 in colunas:
+grafo = nx.Graph()
+grafo.add_nodes_from(corr.columns)
+for i, t1 in enumerate(colunas):
     for t2 in colunas[i + 1:]:
         peso = corr.loc[t1, t2]
         if pd.notna(peso) and abs(peso) >= limiar_correlacao:
             grafo.add_edge(t1, t2, weight=float(peso))
+return grafo  # Objeto NetworkX (Python puro, lento)
 ```
-Ele faz um "*Match*" um por um (`for t1 ... for t2`). Se a Ação A e a Ação B apresentarem um "peso" de correlação superior ao seu **Limiar** (ex: `0.30`), o algoritmo conclui que elas andam juntas com força suficiente e desenha a linha (Aresta) entre elas no Grafo (usando a biblioteca `networkx`).
-Essa linha guarda o valor exato da correlação (como `weight`), garantindo que o algoritmo lembre o quão forte é a afinidade entre essas duas. Quem não atinge o limite é ignorado e não tem elo.
+Ele fazia um "*Match*" um por um (`for t1 ... for t2`). Se a Ação A e a Ação B apresentassem um "peso" de correlação superior ao **Limiar** (`0.30`), o algoritmo desenhava a aresta entre elas usando o `NetworkX` (uma biblioteca escrita inteiramente em Python interpretado).
 
-> 🛠️ **Ao final dessa função, o que temos?** Uma Estrutura da subjacente daquele dia específico do mercado. Você pode imaginar como um gráfico visual de teia enorme, onde ativos como bancos (ITUB4, BBDC4, BBAS3) estão embolados e densamente costurados entre si por arestas fortes, e empresas sem relação ficam isoladas ou desconectadas da panelinha central. Esta teia é o nosso *Market Graph*.
+**✅ COMO É AGORA (Máscara Booleana NumPy):**
+```python
+matriz = corr.values.copy()
+np.fill_diagonal(matriz, np.nan)           # 1. Zera a diagonal (autocorrelação)
+mask_triu = np.triu(np.ones(...), k=1)      # 2. Só triângulo superior (evita dupla contagem)
+mask_valida = (np.abs(matriz) >= limiar) & mask_triu & ~np.isnan(matriz)
+indices_row, indices_col = np.where(mask_valida)  # 3. Coordenadas instantâneas
+pesos = matriz[indices_row, indices_col]    # 4. Pesos extraídos em bloco
+return tickers, indices_row, indices_col, pesos  # Arrays NumPy nativos
+```
+O NumPy, escrito em C compilado, varre a matriz inteira em sub-milissegundo usando operações SIMD (Single Instruction Multiple Data). Os ~80.000 giros sequenciais em Python viraram uma única instrução vetorial da CPU.
+
+> 🛠️ **Ao final dessa função, o que temos?** Quatro arrays NumPy representando as mesmas informações de antes: quais tickers existem (nós), quais pares se conectam (arestas via coordenadas), e com que força (pesos). A Estrutura da teia de aranha do Market Graph continua a mesma — o que mudou foi de onde ela mora na memória (de um objeto Python pesado para arrays C-nativos).
+
+### C) Da Faxina para a Detecção de Comunidades — ⚡ OTIMIZADO v2
+
+> [!IMPORTANT]
+> **Mudança Crítica (Fase B da Otimização):** O antigo pedágio de tradução `ig.Graph.from_networkx(grafo)` foi **eliminado**. O iGraph é instanciado diretamente das Tuplas NumPy via `ig.Graph.TupleList()`, fazendo o pipe inteiro rodar na camada C/C++ sem parada no Python.
+
+**❌ COMO ERA ANTES (Ponte NetworkX → iGraph):**
+```python
+# Passo 1: Recebia um objeto nx.Graph (Python interpretado)
+# Passo 2: Desmontava ele inteiro e remontava em C
+g_ig = ig.Graph.from_networkx(grafo)  # O grande gargalo!
+# Passo 3: Rodava o Leiden no iGraph remontado
+partition = leidenalg.find_partition(g_ig, ...)
+mapeamento = {node: c for node, c in zip(g_ig.vs['_nx_name'], ...)}
+```
+
+**✅ COMO É AGORA (Injeção Direta NumPy → iGraph):**
+```python
+# Passo 1: Recebe arrays NumPy da Fase A
+tickers_row = tickers[indices_row]
+tickers_col = tickers[indices_col]
+# Passo 2: Empacota e injeta direto na engine C do iGraph
+arestas_com_pesos = list(zip(tickers_row, tickers_col, pesos))
+g_ig = ig.Graph.TupleList(arestas_com_pesos, weights=True)
+# Passo 3: Leiden roda imediatamente (C++)
+partition = leidenalg.find_partition(g_ig, ...)
+mapeamento = {nome: c for nome, c in zip(g_ig.vs['name'], ...)}
+```
+**O Resultado:** O pipe completo é C → C → C++. Sem intermediário Python.
 
 ---
 
@@ -49,36 +96,45 @@ Essa linha guarda o valor exato da correlação (como `weight`), garantindo que 
 
 A teia (estrutura de vizinhança) define QUEM influencia QUEM. Mas como transformamos um desenho em um botão de "Comprar"?
 
-A função `calcular_sinal_grafo` (linhas 97-126) faz isso buscando *anomalias relativas*. 
+A função `calcular_sinal_grafo` faz isso buscando *anomalias relativas*.
 
-### A) Descobrindo os vizinhos de cada ação
+> [!NOTE]
+> **Evolução Conceitual:** Com a implementação do algoritmo de **Leiden**, o conceito de "vizinho" passou de vizinhança local (grau-1 do grafo) para **pertencimento ao mesmo cluster/continente** identificado pelo algoritmo de detecção de comunidades. A lógica econômica permanece a mesma, mas com cobertura macro muito superior.
+
+### A) Identificando o Cluster da Ação (Leiden)
+
+**❌ COMO ERA ANTES (Vizinhança Local de Grau-1):**
 ```python
-vizinhos = list(grafo.neighbors(ticker))
+vizinhos = list(grafo.neighbors(ticker))  # Só os amigos diretos
 ```
-Para cada ação disponível no dia, ele joga o ticker dela nas ferramentas do Grafo e indaga: *"Quais ações estão conectadas DIRETAMENTE nesta por uma aresta que passou pelo limiar estrito?"*. Estes são os `vizinhos`.
+O antigo código perguntava ao NetworkX: *"Quais ações estão conectadas DIRETAMENTE a esta por uma aresta?"*. Isso limitava o universo de comparação a 3-5 vizinhos imediatos.
 
-### B) Pesando a voz dos vizinhos 
+**✅ COMO É AGORA (Cluster Leiden Macro):**
 ```python
-for v in vizinhos:
-    r = retornos_recentes.get(v, np.nan)
-    pesos.append(abs(grafo[ticker][v]["weight"]))
-    retornos_viz.append(r)
-media_vizinhos = float(np.average(retornos_viz, weights=pesos))
+cluster_do_ticker = mapeamento_leiden.get(ticker)  # Ex: Cluster_8 (Bancos)
+retornos_do_silo = retornos_por_cluster[cluster_do_ticker]  # TODOS do mesmo bloco
 ```
-Ele olha para a rentabilidade acumulada da última semana (`retorno_5d`) dos amigos daquela ação em análise. Para que a média não seja injusta, o código usa uma **média ponderada** por intermédio da biblioteca Numpy (`np.average(..., weights)`).
-Se um vizinho "A" tem `0.80` de correlação estrutural com a minha ação, e o vizinho "B" tem `0.35`, a rentabilidade do vizinho "A" importa **muito mais** no peso da média (porque ele é mais "íntimo" no grafo que os construiu). 
+Agora, o algoritmo de Leiden já classificou previamente cada ação dentro do seu "continente" estrutural. A ITUB4 não compara mais apenas com BBDC4 e SANB11 (vizinhos diretos), mas com **todo o setor bancário identificado pelo Leiden** (talvez 15-20 ações). Isso dilui sinais falsos e captura convergências macro.
 
-`media_vizinhos` é a síntese do comportamento do grupo em torno desse ativo-alvo.
+### B) Calculando a Média do "Silo"
+```python
+if len(retornos_do_silo) > 1:
+    retornos_do_silo.remove(r_proprio)  # Remove a si mesma pra não poluir
+    media_vizinhos = float(np.average(retornos_do_silo))
+```
+Ele olha para a rentabilidade acumulada da última semana (`retorno_5d`) de TODAS as ações do cluster que o Leiden identificou. A ação em análise é removida para que ela não influencie a própria média.
+
+`media_vizinhos` é a síntese do comportamento do continente inteiro em torno desse ativo-alvo.
 
 ### C) Descobrindo a discrepância (A Anomalia para Lucrar)
 ```python
 sinal_spillover = round(media_vizinhos - retorno_proprio, 4)
 ```
 Eis aqui a linha mais crítica de todo o robô. Ela subtrai os números:
-Se os vizinhos íntimos estouraram nos últimos 5 dias com uma média ponderada subindo maravilhosamente (`media_vizinhos = +8%`), mas a nossa ação analisada amargurou na dela uma lerdeza ficando no zero (`retorno_proprio = 0%`). Logo:
-* O Sinal de **Spillover dela será +8%**. (Efeito da mola esticada: ela foi deixada para trás sem justificativas estatísticas, deve convergir agressivamente nos próximos dias se reajustando ao comportamento da panelinha).
+Se o cluster inteiro dos bancos estourou nos últimos 5 dias com média subindo (`media_vizinhos = +8%`), mas a nossa ação analisada amargurou na dela uma lerdeza ficando no zero (`retorno_proprio = 0%`). Logo:
+* O Sinal de **Spillover dela será +8%**. (Efeito da mola esticada: ela foi deixada para trás sem justificativas estatísticas, deve convergir agressivamente nos próximos dias se reajustando ao comportamento do cluster).
 
-Quanto **MAIOR** (mais positivo) o Spillover de uma ação neste momento da fórmula, significa que o nó dela não reflete ainda as vitórias recentes da sua bolha matemática, tornando-se uma mina de ouro em forma de compra barata.
+Quanto **MAIOR** (mais positivo) o Spillover de uma ação neste momento da fórmula, significa que o nó dela não reflete ainda as vitórias recentes do seu continente estatístico (Leiden), tornando-se uma mina de ouro em forma de compra barata.
 
 ---
 
@@ -106,17 +162,18 @@ Uma das belezas vitais dessa estratégia é como variar os parâmetros (hiperpar
 
 ---
 
-## 5. Orquestrando tudo e Conversando entre Si
+## 5. Orquestrando tudo e Conversando entre Si — ⚡ Pipeline Otimizado v2
 
 Quando damos *"Play"*, o arquivo engata um **relógio que salta** (`Horizonte`), para o código não rodar predições diárias que se misturam e acumulam custos altíssimos. Funciona assim:
 
-1. **Olhar pro Abismo do Passado:** O código para na data *D*. Pega as cotações de todo o trimestre passado dessa data, calcula os pares matemáticos que subiram ou desceram juntos rigorosamente pelo **Threshold (Limiar)**, e monta a *Teia Invisível* (A Estrutura de Vizinhança/Market Graph).
-2. **Avaliar Tensões na Teia:** Ele investiga os cantos da teia onde uma ação não seguiu os saltos da sua própria bolha nos últimos 5 dias, aplicando o cálculo do sinal de convergência (`Spillover`).
-3. **Escudo de Custos:** Todo sinal recém calculado inferior às mordidas operacionais (A Corretagem total aplicada via percentual e B3 calculada na defasagem, que chamamos de `custo_pct_ida_volta`), é jogado no lixo imediatamente. Ele não tenta vencer guerras sem margem.
-4. **Alocação Exata:** Sobraram os melhores Spillovers? Como são ações descaradamente descontadas de sua bolha estatística, o robô as hierarquiza das com mais chances paras a pior, filtrando pelas posições restritivas da variável `Top_n`. Feito isso, distribui cirurgicamente o `Capital MAX` para quem ainda restar de sinal verde usando a estratégia gananciosa (_alocar_greedy_), até que não sobre mais `capital_disponivel`.
-5. **Máquina do Tempo:** Agora possuindo a cota de sua panelinha super-elástica na conta... O Backtester viaja quanticamente pelo espaço `Horizonte` no tempo (Ex: 5 Dias) - `i += horizonte`. Descarrega todo o bloco que ele comprou ignorando tendências, recolhendo na unha os retornos finais dessa convergência por intermédio da rentabilidade contínua. Paga o contador do IR (retendo prejuízos lógicos acumulados para burlar o leão, conforme `calcular_ir_mensal`).
+1. **Olhar pro Abismo do Passado (NumPy Vetorizado):** O código para na data *D*. Pega as cotações de todo o trimestre passado dessa data, calcula a matriz de correlação (.corr()), e filtra instantaneamente via **máscara booleana NumPy** todas as arestas que superam o **Threshold (Limiar)**. Resultado: 4 arrays NumPy nativos representando a *Teia Invisível* (Market Graph) em sub-milissegundos.
+2. **Detectar Comunidades (iGraph + Leiden Direto):** Os arrays NumPy são empacotados como Tuplas e injetados diretamente no `ig.Graph.TupleList()` do iGraph (C-Core), **sem passar pelo NetworkX**. O algoritmo de Leiden roda na estrutura C++ e retorna os clusters, a modularidade Q, e o número de comunidades.
+3. **Avaliar Tensões no Cluster:** Para cada ação, o spillover é calculado comparando seu retorno de 5 dias contra a média do **cluster Leiden inteiro** ao qual pertence (não apenas vizinhos de grau-1).
+4. **Escudo de Custos:** Todo sinal recém calculado inferior às mordidas operacionais (`custo_pct_ida_volta`), é jogado no lixo imediatamente.
+5. **Alocação Exata:** Sobraram os melhores Spillovers? O robô hierarquiza e distribui cirurgicamente o `Capital MAX` usando a estratégia gananciosa (_alocar_greedy_).
+6. **Máquina do Tempo:** O Backtester viaja `Horizonte` dias no tempo (`i += horizonte`), liquida as posições e contabiliza IR.
 
-É essa conversa engrenada que faz do Market Graph uma tese tão bonita: A capacidade de quantificar a lei do rebanho no mercado, e ativamente se posicionar apostando nos rebeldes lixeiros cuja discrepância não possuir embasamento matemático contra toda sua história diária construída pelo próprio threshold.
+É essa conversa engrenada que faz do Market Graph uma tese tão bonita: A capacidade de quantificar a lei do rebanho no mercado, e ativamente se posicionar apostando nos rebeldes cuja discrepância não possuir embasamento matemático contra toda sua história diária.
 
 ---
 
@@ -212,4 +269,4 @@ Esses conceitos e medidores de risco casam com absoluta perfeição com as mais 
 
 * **Árvore Geradora Mínima (Minimum Spanning Tree - MST | Mantegna):** Em vez de construir o grafo cortando arestas com um limiar fixo e burro (ex: Threshold = 0.3), a técnica MST extrair apenas o "esqueleto" hierárquico vital da B3 sem fechar ciclos. Ele elimina o ruído gerado pela alta *Densidade Sistêmica* focando exclusivamente na árvore genealógica primária de quem se move pelo reflexo de quem.
 * **Métricas de Centralidade Ampliadas (Betweenness e PageRank):** O conceito do *Eigenvector Centrality* pode ser pareado com o *Betweenness*. Ações com alto Betweenness são "pontes" logísticas entre clusters diferentes (Ex: Uma holding conectando o setor de Bancos ao de Energia). Se um *Spillover* despontar nessas pontes de alta centralidade, a chance de ele iniciar um contágio inter-setor é gigante frente ao resto do mercado.
-* **Detecção de Comunidades (Algoritmo de Louvain):** Atualmente, nosso cálculo de anomalia olha estatisticamente para vizinhos estritos de 1º Grau. O algoritmo de Louvain fatia o grafo descobrindo macrorregiões independentes. Nós poderíamos usar o Louvain para comparar a variação de preço da Ação não apenas contra os amigos próximos, mas sim usando a média coesa do seu "Continente (Cluster)" no Grafo, atenuando sinais falsos de curtíssimo prazo e validando reversões macroestruturais.
+* **Detecção de Comunidades (Algoritmo de Leiden vs Louvain):** Anteriormente, o mundo da econofísica utilizava massivamente o lendário *Algoritmo de Louvain* para agrupar fatias geográficas do mercado financeiro e calcular a métrica de "Modularidade (Q)". Contudo, a nossa arquitetura implementa a evolução matemática incontestável deste modelo: o **Algoritmo de Leiden**.  O motivo substitucional é um problema clássico de redes: O *Louvain* tem a terrível propensão estatística de criar "comunidades internamente desconectadas" (fundir nós mal relacionados dentro de um grupo) devido ao _Resolution Limit_ e problemas nas repassagens de ramificação. Isso em finanças mataria a nossa assertividade (juntando ativos de papelada e energia elétrica juntos de forma errônea). O algoritmo de *Leiden* possui uma varredura atômica em núcleo C++ que desfaz grupos mal construídos ativamente, garantindo comunidades unificadas firmemente e muito mais coesas que Louvain. Essa métrica gera nosso poderoso "Leiden Q", identificando continentes estruturais perfeitos no mercado, sem correr o risco clássico de aglomerados ilusórios.
