@@ -1,7 +1,0 @@
-pandas
-numpy
-streamlit
-pyarrow
-networkx
-requests
-yfinance   # Ibovespa (^BVSP) — usado por benchmarks_externos.py e pela busca automática no app_grafo.py
