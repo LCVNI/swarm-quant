@@ -3,3 +3,10 @@
 
 # Ignorar arquivos zip
 *.zip
+#ignorar ambiente virtual
+.venv/
+venv/
+.env/
+env/
+#ignorar cache
+__pycache__/
