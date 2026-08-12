@@ -3,6 +3,7 @@ entre ações (market graph), sem machine learning.
 
 Depende só de grafo_estrategia.py + streamlit/pandas. Não importa core.py.
 """
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -10,6 +11,33 @@ import grafo_estrategia as ge
 import metricas_risco as mr
 
 st.set_page_config(page_title="Estratégia de Grafo de Correlação (B3)", layout="wide")
+
+# ── Fase 4: CSS para exportação PDF via navegador ──────────────────────────
+st.markdown("""
+<style>
+@media print {
+    /* Oculta sidebar, header, footer e controles interativos */
+    section[data-testid="stSidebar"],
+    header[data-testid="stHeader"],
+    .stDeployButton,
+    div[data-testid="stToolbar"],
+    .stButton > button:not(.print-trigger),
+    .stFileUploader,
+    .stNumberInput,
+    .stSelectbox,
+    .stRadio,
+    .stExpander,
+    footer { display: none !important; }
+
+    /* Remove margens para maximizar espaço */
+    .block-container { padding: 0 !important; max-width: 100% !important; }
+
+    /* Gráficos 16:9 */
+    div[data-testid="stVegaLiteChart"] { width: 100% !important; aspect-ratio: 16/9; }
+}
+</style>
+""", unsafe_allow_html=True)
+
 st.title("Estratégia B3 baseada em grafo de correlação")
 
 st.warning(
@@ -271,7 +299,57 @@ if "dados_grafo" in st.session_state:
                             "Jensen, Beta e a comparação completa com os dois benchmarks."
                         )
 
-                st.line_chart(resumo.set_index("data_decisao")["capital_apos_periodo"])
+                # ── Fase 1: curva de capital com benchmarks ─────────────
+                st.subheader("Evolução do capital")
+                curva_df = resumo.set_index("data_decisao")[["capital_apos_periodo"]].rename(
+                    columns={"capital_apos_periodo": "Estratégia"}
+                )
+                _data_min_bt = pd.Timestamp(resumo["data_decisao"].min())
+                _data_max_bt = pd.Timestamp(resumo["data_decisao"].max())
+                if d.get("selic") is not None:
+                    _selic_curva = mr.curva_capital_selic(d["selic"], _data_min_bt, _data_max_bt, capital_inicial)
+                    if not _selic_curva.empty:
+                        curva_df = curva_df.join(_selic_curva.rename("SELIC"), how="outer")
+                if d.get("ibovespa") is not None:
+                    _ibov_curva = mr.curva_capital_ibovespa(d["ibovespa"], _data_min_bt, _data_max_bt, capital_inicial)
+                    if not _ibov_curva.empty:
+                        curva_df = curva_df.join(_ibov_curva.rename("Ibovespa"), how="outer")
+                st.line_chart(curva_df)
+
+                # ── Fase 2: gráficos complementares ────────────────────
+                with st.expander("Análise complementar (gráficos)", expanded=False):
+                    # DARF mensal
+                    if not ir_mensal.empty:
+                        st.markdown("##### DARF mensal (R$)")
+                        darf_chart = ir_mensal.set_index("mes")[["darf_a_pagar"]]
+                        st.bar_chart(darf_chart)
+
+                    # Drawdown
+                    st.markdown("##### Drawdown ao longo do tempo")
+                    dd_series = mr.serie_drawdown(resumo, capital_inicial)
+                    st.area_chart(dd_series.rename("Drawdown (%)"))
+
+                    # Distribuição de lucro por operação
+                    if not operacoes.empty and "lucro" in operacoes.columns:
+                        st.markdown("##### Distribuição do lucro por operação")
+                        hist_vals, hist_bins = np.histogram(operacoes["lucro"].dropna(), bins=30)
+                        bin_labels = [f"{hist_bins[i]:.0f}" for i in range(len(hist_vals))]
+                        st.bar_chart(pd.DataFrame({"Frequência": hist_vals}, index=bin_labels))
+
+                    # Retorno mensal
+                    st.markdown("##### Retorno mensal")
+                    _r_mensal = resumo.copy()
+                    _r_mensal["data_decisao"] = pd.to_datetime(_r_mensal["data_decisao"])
+                    _r_mensal["mes"] = _r_mensal["data_decisao"].dt.to_period("M").astype(str)
+                    retorno_mes = _r_mensal.groupby("mes")["lucro_periodo"].sum()
+                    st.bar_chart(retorno_mes.rename("Lucro mensal (R$)"))
+
+                    # Dispersão sinal vs retorno realizado
+                    if not operacoes.empty and "sinal" in operacoes.columns and "retorno_realizado" in operacoes.columns:
+                        st.markdown("##### Sinal previsto vs. retorno realizado")
+                        scatter_df = operacoes[["sinal", "retorno_realizado"]].dropna()
+                        st.scatter_chart(scatter_df, x="sinal", y="retorno_realizado")
+
                 st.subheader("Resumo por período")
                 st.dataframe(resumo, use_container_width=True)
                 st.subheader("Apuração de IR mensal (DARF)")
@@ -281,6 +359,15 @@ if "dados_grafo" in st.session_state:
                     st.dataframe(ir_mensal, use_container_width=True)
                 st.subheader("Todas as operações simuladas")
                 st.dataframe(operacoes, use_container_width=True)
+
+                # ── Fase 4: botão PDF ──────────────────────────────────
+                st.markdown("---")
+                st.markdown(
+                    '<button onclick="window.print()" style="padding:10px 24px;font-size:16px;'
+                    'background:#1f77b4;color:white;border:none;border-radius:6px;cursor:pointer">'
+                    '📄 Gerar PDF do Relatório (via Navegador)</button>',
+                    unsafe_allow_html=True,
+                )
 
     else:
         st.caption(
@@ -345,10 +432,33 @@ if "dados_grafo" in st.session_state:
                 )
 
             if curvas:
+                # ── Fase 1: adicionar benchmarks à comparação ──────────
+                if d.get("selic") is not None or d.get("ibovespa") is not None:
+                    _todas_datas = pd.concat([s for s in curvas.values()], axis=1)
+                    _data_min_cmp = _todas_datas.index.min()
+                    _data_max_cmp = _todas_datas.index.max()
+                    if d.get("selic") is not None:
+                        _s = mr.curva_capital_selic(d["selic"], _data_min_cmp, _data_max_cmp, d["capital"])
+                        if not _s.empty:
+                            curvas["SELIC"] = _s
+                    if d.get("ibovespa") is not None:
+                        _ib = mr.curva_capital_ibovespa(d["ibovespa"], _data_min_cmp, _data_max_cmp, d["capital"])
+                        if not _ib.empty:
+                            curvas["Ibovespa"] = _ib
+
                 st.subheader("Evolução do capital por estratégia")
                 st.line_chart(pd.DataFrame(curvas))
 
             st.session_state.comparacao_grafo = detalhes
+
+            # ── Fase 4: botão PDF na comparação ────────────────────
+            st.markdown("---")
+            st.markdown(
+                '<button onclick="window.print()" style="padding:10px 24px;font-size:16px;'
+                'background:#1f77b4;color:white;border:none;border-radius:6px;cursor:pointer">'
+                '📄 Gerar PDF do Relatório (via Navegador)</button>',
+                unsafe_allow_html=True,
+            )
 
         if "comparacao_grafo" in st.session_state:
             with st.expander("Ver detalhes de cada estratégia (operações e IR)"):

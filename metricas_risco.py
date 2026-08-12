@@ -72,6 +72,50 @@ def _retorno_ibov_periodo(ibov: pd.DataFrame, data_inicio: pd.Timestamp, data_fi
     return float(depois.iloc[-1] / antes.iloc[-1] - 1)
 
 
+# ---------------------------------------------------------------------------
+# Curvas de capital dos benchmarks (Fase 1 do plano de implementação)
+# ---------------------------------------------------------------------------
+def curva_capital_selic(
+    selic: pd.Series, data_inicio, data_fim, capital_inicial: float,
+) -> pd.Series:
+    """Série diária de capital acumulado aplicando a SELIC diária."""
+    data_inicio = pd.Timestamp(data_inicio)
+    data_fim = pd.Timestamp(data_fim)
+    janela = selic[(selic.index >= data_inicio) & (selic.index <= data_fim)]
+    if janela.empty:
+        return pd.Series(dtype=float)
+    return capital_inicial * (1 + janela).cumprod()
+
+
+def curva_capital_ibovespa(
+    ibovespa: pd.DataFrame, data_inicio, data_fim, capital_inicial: float,
+) -> pd.Series:
+    """Série diária de capital se tivesse comprado o Ibovespa no início."""
+    data_inicio = pd.Timestamp(data_inicio)
+    data_fim = pd.Timestamp(data_fim)
+    precos = ibovespa["fechamento_ajustado"]
+    janela = precos[(precos.index >= data_inicio) & (precos.index <= data_fim)]
+    if janela.empty:
+        return pd.Series(dtype=float)
+    return capital_inicial * (janela / janela.iloc[0])
+
+
+# ---------------------------------------------------------------------------
+# Série de drawdown (Fase 2 — gráfico de drawdown ao longo do tempo)
+# ---------------------------------------------------------------------------
+def serie_drawdown(resumo: pd.DataFrame, capital_inicial: float) -> pd.Series:
+    """Retorna uma Series indexada por data_decisao com o drawdown percentual."""
+    r = resumo.copy()
+    r["data_decisao"] = pd.to_datetime(r["data_decisao"])
+    curva = pd.concat(
+        [pd.DataFrame({"data_decisao": [r["data_decisao"].iloc[0]], "capital_apos_periodo": [capital_inicial]}), r],
+        ignore_index=True,
+    )
+    pico = curva["capital_apos_periodo"].cummax()
+    dd = (curva["capital_apos_periodo"] - pico) / pico
+    return dd.set_axis(curva["data_decisao"])
+
+
 def _anualizar(retorno_total: float, dias_totais: float) -> float:
     if dias_totais <= 0 or pd.isna(retorno_total):
         return float("nan")

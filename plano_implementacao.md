@@ -85,6 +85,32 @@ Ordem sugerida de implementação (do mais barato ao mais caro):
 
 ---
 
+## Fase 4 — Exportação de Relatório Consolidado (Nativo via Streamlit + CSS)
+**Prioridade: alta.** Necessário para compilar o desempenho da estratégia em um único material avaliatório de forma rápida. Ideal para a comunicação com a banca e construção do relatório final.
+
+### Objetivo
+Permitir que os resultados estritamente analisados (gráficos e a tabela de métricas) sejam exportados para PDF nativamente, sem perder tempo com processamento repetitivo de bibliotecas de imagem no backend (evitando o delay e a sobrecarga de geradores paralelos como Matplotlib e Reportlab).
+
+### Como Implementar Passo a Passo no `app_grafo.py`
+
+1. **Reutilização do Motor de Gráficos do Streamlit**
+   - Mantemos a plotagem totalmente delegada ao Frontend (usando `st.line_chart` ou `st.altair_chart`). O Streamlit já processa e exibe a curva de capital; qualquer re-renderização usando Python causaria atrasos de execução (*bottleneck*). O objetivo é utilizar exatamente o que o Streamlit já provê nativamente.
+2. **Injeção de Regras CSS `@media print` no Documento**
+   - Adicionaremos um bloco de customização `st.markdown("<style>...</style>", unsafe_allow_html=True)`.
+   - Essa folha de estilo oculta menus laterais (sidebar), caixas de input, botões de ação e margens desnecessárias *exclusivamente e somente quando o usuário mandar imprimir ou salvar o documento*.
+   - Garantiremos que os gráficos abram e ocupem a totalidade do aspecto 16:9.
+3. **Botão Acionador de PDF Frontend**
+   - Ao invés de um backend downloader pesado, inserimos um botão estético "Gerar PDF do Relatório (via Navegador)" que utiliza HTML nativo ou simples instrução para acionar a janela de Exportação / Print do browser (ex: `window.print()`).
+4. **Vantagem da Exportação para o Usuário**
+   - O documento final aterrissa como um **PDF nativo**. 
+   - **Zero tempo de espera do servidor**, pois aproveitamos a compilação local da plataforma.
+   - Idêntico ao relatório em tela, o que impede discrepâncias, garantindo altíssima performance estrutural do projeto.
+
+### Impacto na estratégia
+**Nenhum.** Não afeta a mecânica de alocação ou simulação. O impacto se limita à operacionalização, mas agrega muito valor analítico na gestão.
+
+---
+
 ## Resumo executivo
 
 | Fase | O que faz | Impacto na estratégia | Urgência |
@@ -92,5 +118,6 @@ Ordem sugerida de implementação (do mais barato ao mais caro):
 | 1 | Benchmarks SELIC/Ibovespa no gráfico | Nenhum (visual) | Imediata |
 | 2 | Gráficos complementares de análise | Nenhum (visual, exceto densidade do grafo) | Alta |
 | 3 | Filtro de universo investível | Sim (dado de entrada) | Importante, mas exige estudo — fazer por último |
+| 4 | Exportação de Relatório Consolidado | Nenhum (exportação/visual) | Alta |
 
 **Fontes reaproveitadas:** `metricas_risco.py` (`_retorno_selic_periodo`, `_retorno_ibov_periodo`, `calcular_metricas_risco`), `grafo_estrategia.py` (`_backtest_com_sinal`, `calcular_ir_mensal`, `carregar_dados`), `diagnostico_artefatos.py` (`composicao_por_bdi`, `retornos_extremos`), `universo.py` (`filtrar_universo`, `ajustar_por_fator_cotacao`, `marcar_descontinuidades`), `app_grafo.py` (estrutura atual de session_state e gráficos).
