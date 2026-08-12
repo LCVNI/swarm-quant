@@ -9,6 +9,7 @@ import streamlit as st
 
 import grafo_estrategia as ge
 import metricas_risco as mr
+import universo as uv
 
 st.set_page_config(page_title="Estratégia de Grafo de Correlação (B3)", layout="wide")
 
@@ -66,6 +67,21 @@ with st.expander("Metodologia (o que é isso, tecnicamente)"):
 
 arquivo = st.file_uploader("Arquivo processado (parquet ou csv, saída do b3_cotahist.py)", type=["parquet", "csv"])
 
+# ── Fase 3: Filtro de Universo Investível ──────────────────────────────────
+with st.expander("Filtros de Universo Investível (Fase 3)", expanded=False):
+    aplicar_filtro = st.checkbox("Restringir a ativos líquidos e reais (recomendado)", value=True,
+                                 help="Remove fundos, BDRs, papéis em RJ e ativos de pouquíssima liquidez.")
+    col_u1, col_u2, col_u3 = st.columns(3)
+    preco_min = col_u1.number_input("Preço Mínimo (R$)", value=1.0, step=0.5,
+                                    help="Descarta ações negociadas na casa de centavos (onde 1 tick = 20% variação).")
+    vol_min = col_u2.number_input("Volume Mediano (R$ na janela)", value=1_000_000.0, step=100000.0)
+    neg_min = col_u3.number_input("Nº de Negócios (mediano)", value=100, step=10)
+    
+    col_u4, col_u5 = st.columns(2)
+    sufixo_acao = col_u4.checkbox("Exigir formato de Ação (exclui 11, BDRs)", value=False)
+    janela_liq = col_u5.number_input("Janela móvel de liquidez (dias)", value=60, step=10,
+                                     help="Calcula a mediana dinamicamente usando os pregões passados, evitando viés futuro.")
+# ─────────────────────────────────────────────────────────────────────────────
 with st.expander("Benchmarks para métricas de risco (opcional: SELIC e Ibovespa)"):
     col_selic, col_ibov = st.columns(2)
     arquivo_selic = col_selic.file_uploader(
@@ -144,6 +160,25 @@ if arquivo and st.button("Carregar dados"):
         with open(caminho, "wb") as f:
             f.write(arquivo.getbuffer())
         df = ge.carregar_dados(caminho)
+
+        # ── Fase 3: Aplicação real dos filtros ────────────────────────────────
+        if aplicar_filtro:
+            df = uv.ajustar_por_fator_cotacao(df)
+            df, relatorio_filtro = uv.filtrar_universo(
+                df,
+                preco_minimo=float(preco_min),
+                volume_mediano_minimo=float(vol_min),
+                negocios_minimos=int(neg_min),
+                janela_liquidez=int(janela_liq),
+                exigir_sufixo_acao=sufixo_acao,
+            )
+            df = uv.marcar_descontinuidades(df, max_dias_gap=10)
+            st.session_state.relatorio_filtro = relatorio_filtro
+        else:
+            if "relatorio_filtro" in st.session_state:
+                del st.session_state["relatorio_filtro"]
+        # ───────────────────────────────────────────────────────────────────
+
         df = ge.construir_features_grafo(df, horizonte=int(horizonte))
 
         selic = None
@@ -352,6 +387,13 @@ if "dados_grafo" in st.session_state:
 
                 st.subheader("Resumo por período")
                 st.dataframe(resumo, use_container_width=True)
+                
+                # ── Exibe o log do filtro da Fase 3 se ativado ───────────
+                if "relatorio_filtro" in st.session_state:
+                    st.subheader("Impacto do Filtro de Universo (Auditoria)")
+                    st.dataframe(st.session_state.relatorio_filtro, use_container_width=True)
+                # ────────────────────────────────────────────────────────
+
                 st.subheader("Apuração de IR mensal (DARF)")
                 if ir_mensal.empty:
                     st.info("Nenhuma venda com data suficiente para apurar IR mensal.")

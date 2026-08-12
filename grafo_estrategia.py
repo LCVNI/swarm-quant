@@ -69,11 +69,20 @@ def carregar_dados(caminho: str) -> pd.DataFrame:
 
 def construir_features_grafo(df: pd.DataFrame, horizonte: int = HORIZONTE_PADRAO) -> pd.DataFrame:
     """Só o que a estratégia de grafo precisa: retorno_1d (monta o grafo),
-    retorno_5d (sinal de curto prazo) e retorno_futuro (realização real)."""
+    retorno_5d (sinal de curto prazo) e retorno_futuro (realização real).
+    
+    Respeita 'retorno_valido' vindo do módulo universo.py para não costurar GAPs.
+    """
     g = df.groupby("ticker", group_keys=False)["preco_fechamento"]
     df["retorno_1d"] = g.pct_change(1)
     df["retorno_5d"] = g.pct_change(5)
     df["retorno_futuro"] = g.transform(lambda s: s.shift(-horizonte) / s - 1)
+    
+    if "retorno_valido" in df.columns:
+        invalido = ~df["retorno_valido"].fillna(True)
+        # Se a própria mudança for através de um período inválido, zera-se o sinal
+        df.loc[invalido, ["retorno_1d", "retorno_5d", "retorno_futuro"]] = np.nan
+        
     return df
 
 
