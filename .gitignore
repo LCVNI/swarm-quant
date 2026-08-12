@@ -1,8 +1,10 @@
-# Ignorar arquivos parquet
+# Ignorar arquivos de dados
 *.parquet
-
+*.csv
+*json
 # Ignorar arquivos zip
 *.zip
+*.ZIP
 #ignorar ambiente virtual
 .venv/
 venv/
