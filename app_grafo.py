@@ -27,7 +27,6 @@ st.markdown("""
     .stNumberInput,
     .stSelectbox,
     .stRadio,
-    .stExpander,
     footer { display: none !important; }
 
     /* Remove margens para maximizar espaço */
@@ -35,7 +34,23 @@ st.markdown("""
 
     /* Gráficos 16:9 */
     div[data-testid="stVegaLiteChart"] { width: 100% !important; aspect-ratio: 16/9; }
+
+    /* Protege gráficos, tabelas e métricas contra corte entre páginas */
+    div[data-testid="stVegaLiteChart"],
+    div[data-testid="stDataFrame"],
+    div[data-testid="stMetric"],
+    div[data-testid="stExpander"] {
+        page-break-inside: avoid !important;
+        break-inside: avoid !important;
+    }
+
+    /* Visibilidade condicional: oculta interativo, mostra estático */
+    .screen-only { display: none !important; }
+    .print-only  { display: block !important; }
 }
+
+/* Fora do print: mostra interativo, oculta estático */
+.print-only { display: none; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -349,14 +364,13 @@ if "dados_grafo" in st.session_state:
                     _ibov_curva = mr.curva_capital_ibovespa(d["ibovespa"], _data_min_bt, _data_max_bt, capital_inicial)
                     if not _ibov_curva.empty:
                         curva_df = curva_df.join(_ibov_curva.rename("Ibovespa"), how="outer")
-                
                 # Corrige a ocultação do gráfico ffillando os dias ociosos da estratégia
                 curva_df = curva_df.ffill().fillna(capital_inicial)
                 
                 st.line_chart(curva_df)
 
                 # ── Fase 2: gráficos complementares ────────────────────
-                with st.expander("Análise complementar (gráficos)", expanded=False):
+                with st.expander("Análise complementar (gráficos)", expanded=True):
                     # DARF mensal
                     if not ir_mensal.empty:
                         st.markdown("##### DARF mensal (R$)")
@@ -408,11 +422,14 @@ if "dados_grafo" in st.session_state:
 
                 # ── Fase 4: botão PDF ──────────────────────────────────
                 st.markdown("---")
-                st.markdown(
-                    '<button onclick="window.print()" style="padding:10px 24px;font-size:16px;'
-                    'background:#1f77b4;color:white;border:none;border-radius:6px;cursor:pointer">'
-                    '📄 Gerar PDF do Relatório (via Navegador)</button>',
-                    unsafe_allow_html=True,
+                import streamlit.components.v1 as components
+                components.html(
+                    """
+                    <button onclick="window.parent.print()" style="padding:10px 24px;font-size:16px;background:#1f77b4;color:white;border:none;border-radius:6px;cursor:pointer;width:100%;">
+                    📄 Gerar PDF do Relatório (via Navegador)
+                    </button>
+                    """,
+                    height=50
                 )
 
     else:
@@ -501,17 +518,21 @@ if "dados_grafo" in st.session_state:
 
             # ── Fase 4: botão PDF na comparação ────────────────────
             st.markdown("---")
-            st.markdown(
-                '<button onclick="window.print()" style="padding:10px 24px;font-size:16px;'
-                'background:#1f77b4;color:white;border:none;border-radius:6px;cursor:pointer">'
-                '📄 Gerar PDF do Relatório (via Navegador)</button>',
-                unsafe_allow_html=True,
+            import streamlit.components.v1 as components
+            components.html(
+                """
+                <button onclick="window.parent.print()" style="padding:10px 24px;font-size:16px;background:#1f77b4;color:white;border:none;border-radius:6px;cursor:pointer;width:100%;">
+                📄 Gerar PDF do Relatório (via Navegador)
+                </button>
+                """,
+                height=50
             )
 
         if "comparacao_grafo" in st.session_state:
-            with st.expander("Ver detalhes de cada estratégia (operações e IR)"):
+            with st.expander("Ver detalhes de cada estratégia (operações e IR)", expanded=True):
                 nome_detalhe = st.selectbox("Estratégia para detalhar", list(st.session_state.comparacao_grafo.keys()))
                 operacoes, resumo, ir_mensal = st.session_state.comparacao_grafo[nome_detalhe]
                 st.dataframe(resumo, use_container_width=True)
-                st.dataframe(ir_mensal, use_container_width=True) if not ir_mensal.empty else None
+                if not ir_mensal.empty:
+                    st.dataframe(ir_mensal, use_container_width=True)
                 st.dataframe(operacoes, use_container_width=True)
