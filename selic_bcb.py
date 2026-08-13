@@ -1,10 +1,18 @@
-
 """
 Pipeline para baixar dados históricos diários da Selic
 através da API oficial do Banco Central do Brasil (SGS).
 
 Série utilizada:
-    1178 - Taxa de juros - Selic anualizada base 252
+    11 - Taxa de juros - Selic (taxa diária, divulgada em % ao dia)
+
+IMPORTANTE: esta série é a que `metricas_risco.carregar_selic` espera —
+valores pequenos, tipo "0.024620" (% ao dia). A série 1178 ("Selic
+anualizada base 252") é derivada da 11 pela fórmula do BCB
+((SERIE(11)/100+1)^252-1)*100 e vem em % a.a. (valores tipo "13.65").
+Usar a 1178 aqui faria `curva_capital_selic` compor uma taxa ANUAL como
+se fosse diária (`(1 + taxa).cumprod()` por pregão), inflando a curva de
+capital de forma absurda. Não troque sem também ajustar
+`metricas_risco.carregar_selic`/`curva_capital_selic` de volta.
 
 Exemplos:
 
@@ -39,7 +47,7 @@ from pathlib import Path
 import requests
 
 
-SERIE_SGS = 1178
+SERIE_SGS = 11
 
 FONTE = "Banco Central do Brasil - SGS"
 
