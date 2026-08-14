@@ -1,7 +1,7 @@
 # Ignorar arquivos de dados
 *.parquet
 *.csv
-*json
+*.json
 # Ignorar arquivos zip
 *.zip
 *.ZIP
