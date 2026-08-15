@@ -212,8 +212,7 @@ def calcular_metricas_risco(
     else:
         resultado["sharpe"] = None
 
-    downside = excesso[excesso < 0]
-    downside_dev = np.sqrt((downside ** 2).mean()) if not downside.empty else np.nan
+    downside_dev = np.sqrt((excesso.clip(upper=0) ** 2).mean())
     if pd.notna(downside_dev) and downside_dev != 0:
         resultado["sortino"] = round(float(excesso.mean() / downside_dev * np.sqrt(periodos_por_ano)), 3)
     else:
