@@ -99,20 +99,35 @@ def construir_grafo_correlacao(
     janela: int = JANELA_CORRELACAO_PADRAO,
     limiar_correlacao: float = LIMIAR_CORRELACAO_PADRAO,
 ) -> nx.Graph:
-    """Grafo de correlação usando só dados ANTERIORES a `data_referencia` (sem vazamento)."""
+    """Grafo de correlação usando só dados ANTERIORES a `data_referencia` (sem vazamento).
+
+    Versão vetorizada: usa máscara triangular superior (np.triu) + stack do Pandas
+    para eliminar laços O(N²) em Python puro. A inserção de arestas é feita em
+    lote via nx.from_pandas_edgelist (C-level).
+    """
     janela_dados = retornos_pivot[retornos_pivot.index < data_referencia].tail(janela)
-    grafo = nx.Graph()
     if len(janela_dados) < max(20, janela // 3):
-        return grafo
+        return nx.Graph()
 
     corr = janela_dados.corr(min_periods=max(20, janela // 3))
+
+    # 1. Máscara Matricial: triangular superior (exclui diagonal e espelho)
+    mask = np.triu(np.ones(corr.shape, dtype=bool), k=1)
+
+    # 2. Aplainamento (Stack): transforma a matriz em Series (source, target) -> weight
+    #    Renomeia eixos para evitar conflito de nome duplicado ('ticker') no reset_index
+    corr.index.name = "source"
+    corr.columns.name = "target"
+    arestas = corr.where(mask).stack().reset_index(name="weight")
+
+    # 3. Broadcasting de Filtro: filtra NaN e aplica limiar de correlação
+    arestas = arestas[arestas["weight"].abs() >= limiar_correlacao]
+
+    # 4. Inserção em Volume (Batch Edges): monta o grafo de uma só vez
+    grafo = nx.from_pandas_edgelist(arestas, source="source", target="target", edge_attr="weight")
+
+    # Garante que todos os nós existam, mesmo sem arestas (nós isolados)
     grafo.add_nodes_from(corr.columns)
-    colunas = list(corr.columns)
-    for i, t1 in enumerate(colunas):
-        for t2 in colunas[i + 1:]:
-            peso = corr.loc[t1, t2]
-            if pd.notna(peso) and abs(peso) >= limiar_correlacao:
-                grafo.add_edge(t1, t2, weight=float(peso))
     return grafo
 
 
@@ -155,6 +170,10 @@ def construir_grafo_mst(
     d(i,j) = sqrt(2 * (1 - correlação(i,j))). Mantém só as conexões mais essenciais
     de cada ativo (ao contrário do limiar, que mantém TODAS as correlações fortes).
     Fonte: Mantegna, "Hierarchical structure in financial markets" (1999).
+
+    Versão vetorizada: usa máscara triangular superior (np.triu) + stack do Pandas
+    para eliminar laços O(N²) em Python puro. A inserção de arestas é feita em
+    lote via nx.from_pandas_edgelist (C-level).
     """
     janela_dados = retornos_pivot[retornos_pivot.index < data_referencia].tail(janela)
     if len(janela_dados) < max(20, janela // 3):
@@ -162,15 +181,34 @@ def construir_grafo_mst(
 
     corr = janela_dados.corr(min_periods=max(20, janela // 3)).clip(-1, 1)
     distancia = np.sqrt(2 * (1 - corr))
-    grafo_completo = nx.Graph()
-    colunas = list(corr.columns)
-    for i, t1 in enumerate(colunas):
-        for t2 in colunas[i + 1:]:
-            d = distancia.loc[t1, t2]
-            if pd.notna(d):
-                grafo_completo.add_edge(t1, t2, weight=float(d), correlacao=float(corr.loc[t1, t2]))
-    if grafo_completo.number_of_edges() == 0:
+
+    # 1. Máscara Matricial: triangular superior (exclui diagonal e espelho)
+    mask = np.triu(np.ones(corr.shape, dtype=bool), k=1)
+
+    # 2. Aplainamento (Stack): DataFrames empilhados com weight (distância) e correlação
+    #    Renomeia eixos para evitar conflito de nome duplicado ('ticker') no reset_index
+    corr.index.name = "source"
+    corr.columns.name = "target"
+    distancia.index.name = "source"
+    distancia.columns.name = "target"
+    dist_stack = distancia.where(mask).stack().reset_index(name="weight")
+    corr_stack = corr.where(mask).stack().reset_index(name="correlacao")
+
+    # Junta distância + correlação num único DataFrame
+    arestas_df = dist_stack.copy()
+    arestas_df["correlacao"] = corr_stack["correlacao"]
+
+    # Remove pares com distância NaN
+    arestas_df = arestas_df.dropna(subset=["weight"])
+
+    if arestas_df.empty:
         return nx.Graph()
+
+    # 3. Inserção em Volume: monta o grafo completo de uma só vez
+    grafo_completo = nx.from_pandas_edgelist(
+        arestas_df, source="source", target="target",
+        edge_attr=["weight", "correlacao"],
+    )
     return nx.minimum_spanning_tree(grafo_completo, weight="weight")
 
 
