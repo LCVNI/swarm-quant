@@ -349,6 +349,10 @@ if "dados_grafo" in st.session_state:
                     _ibov_curva = mr.curva_capital_ibovespa(d["ibovespa"], _data_min_bt, _data_max_bt, capital_inicial)
                     if not _ibov_curva.empty:
                         curva_df = curva_df.join(_ibov_curva.rename("Ibovespa"), how="outer")
+                
+                # Corrige a ocultação do gráfico ffillando os dias ociosos da estratégia
+                curva_df = curva_df.ffill().fillna(capital_inicial)
+                
                 st.line_chart(curva_df)
 
                 # ── Fase 2: gráficos complementares ────────────────────
@@ -489,7 +493,9 @@ if "dados_grafo" in st.session_state:
                             curvas["Ibovespa"] = _ib
 
                 st.subheader("Evolução do capital por estratégia")
-                st.line_chart(pd.DataFrame(curvas))
+                curvas_df = pd.DataFrame(curvas)
+                curvas_df = curvas_df.ffill().fillna(d.get("capital", 100000.0))
+                st.line_chart(curvas_df)
 
             st.session_state.comparacao_grafo = detalhes
 
