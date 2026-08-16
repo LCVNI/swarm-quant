@@ -7,3 +7,5 @@ networkx
 argparse
 requests
 yfinance
+matplotlib
+plotly
