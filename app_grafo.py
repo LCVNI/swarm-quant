@@ -12,6 +12,7 @@ import streamlit as st
 import grafo_estrategia as ge
 import metricas_risco as mr
 import universo as uv
+import tratamento_eventos_societarios as trat
 
 st.set_page_config(page_title="Estratégia de Grafo de Correlação (B3)", layout="wide")
 
@@ -98,6 +99,18 @@ with st.expander("Filtros de Universo Investível (Fase 3)", expanded=False):
     sufixo_acao = col_u4.checkbox("Exigir formato de Ação (exclui 11, BDRs)", value=False)
     janela_liq = col_u5.number_input("Janela móvel de liquidez (dias)", value=60, step=10,
                                      help="Calcula a mediana dinamicamente usando os pregões passados, evitando viés futuro.")
+# ─────────────────────────────────────────────────────────────────────────────
+with st.expander("Tratamento de Eventos Societários (versão Realista)", expanded=False):
+    st.caption(
+        "Além do universo original, este app também roda em paralelo uma versão que invalida "
+        "operações contaminadas por saltos de preço não ajustados (desdobramento/grupamento). "
+        "Não substitui a versão original — só adiciona uma segunda análise comparativa."
+    )
+    limiar_evento = st.number_input(
+        "Limiar de retorno diário considerado evento societário (%)", min_value=1.0, max_value=500.0,
+        value=60.0, step=5.0,
+        help="Mesmo limiar usado na auditoria de qualidade de dados do projeto (60% por padrão).",
+    ) / 100
 # ─────────────────────────────────────────────────────────────────────────────
 with st.expander("Benchmarks para métricas de risco (opcional: SELIC e Ibovespa)"):
     col_selic, col_ibov = st.columns(2)
@@ -196,20 +209,14 @@ if arquivo and st.button("Carregar dados"):
                 del st.session_state["relatorio_filtro"]
         # ───────────────────────────────────────────────────────────────────
 
+        df_base_para_realista = df.copy()
         df = ge.construir_features_grafo(df, horizonte=int(horizonte))
-        import diagnostico_artefatos as da
 
-        def marcar_eventos_societarios(df, limiar=0.60, horizonte=5):
-            eventos = da.retornos_extremos(df, limiar)  # já existe no seu código
-            df = df.sort_values(["ticker", "data_pregao"]).copy()
-            df["retorno_futuro_valido"] = True
-            for _, row in eventos.iterrows():
-                datas_ticker = df.loc[df["ticker"] == row["ticker"], "data_pregao"]
-                janela = datas_ticker[datas_ticker < row["data_pregao"]].sort_values().tail(horizonte)
-                mask = (df["ticker"] == row["ticker"]) & (df["data_pregao"].isin(janela))
-                df.loc[mask, "retorno_futuro_valido"] = False
-            df.loc[~df["retorno_futuro_valido"], "retorno_futuro"] = np.nan
-            return df
+        # ── Versão Realista: mesma base, com eventos societários tratados ──
+        df_realista = trat.construir_features_grafo_realista(
+            df_base_para_realista, horizonte=int(horizonte), limiar_evento=limiar_evento
+        )
+        # ─────────────────────────────────────────────────────────────────
 
         selic = None
         if arquivo_selic is not None:
@@ -226,7 +233,8 @@ if arquivo and st.button("Carregar dados"):
             ibovespa = mr.carregar_ibovespa(caminho_ibov)
 
     st.session_state.dados_grafo = dict(
-        df=df, capital=capital, capital_max_por_acao=capital_max_por_acao,
+        df=df, df_realista=df_realista, limiar_evento=limiar_evento,
+        capital=capital, capital_max_por_acao=capital_max_por_acao,
         horizonte=int(horizonte), top_n=int(top_n),
         janela_correlacao=int(janela_correlacao), limiar_correlacao=limiar_correlacao,
         taxa_b3=taxa_b3_pct / 100, corretagem_fixa=corretagem_fixa,
@@ -295,6 +303,7 @@ if "dados_grafo" in st.session_state:
         irrf_pct=d["irrf_pct"], janela_correlacao=d["janela_correlacao"],
         limiar_correlacao=d["limiar_correlacao"], data_inicio=data_inicio, data_fim=data_fim,
     )
+    kwargs_comuns_realista = {**kwargs_comuns, "df_features": d["df_realista"]}
 
     if modo == "Rodar uma estratégia":
         escolha = st.selectbox("Estratégia", list(ESTRATEGIAS.keys()))
@@ -305,6 +314,14 @@ if "dados_grafo" in st.session_state:
                     operacoes, ir_aliquota=d["ir_aliquota"], isencao_vendas_mensal=d["isencao_mensal"]
                 )
                 st.session_state.resultado_backtest_grafo = (operacoes, resumo, ir_mensal, d["capital"])
+
+                # ── Versão Realista: mesma estratégia, base com eventos societários tratados ──
+                operacoes_r, resumo_r = _rodar_estrategia(ESTRATEGIAS[escolha], **kwargs_comuns_realista)
+                ir_mensal_r = ge.calcular_ir_mensal(
+                    operacoes_r, ir_aliquota=d["ir_aliquota"], isencao_vendas_mensal=d["isencao_mensal"]
+                )
+                st.session_state.resultado_backtest_grafo_realista = (operacoes_r, resumo_r, ir_mensal_r, d["capital"])
+                # ──────────────────────────────────────────────────────────────────────────
 
         if "resultado_backtest_grafo" in st.session_state:
             operacoes, resumo, ir_mensal, capital_inicial = st.session_state.resultado_backtest_grafo
@@ -485,6 +502,111 @@ if "dados_grafo" in st.session_state:
                     height=50
                 )
 
+                # ═══════════════════════════════════════════════════════════════
+                # ── Versão Realista (tratamento de eventos societários) ────────
+                # Seção adicional e independente — não substitui nada acima.
+                # ═══════════════════════════════════════════════════════════════
+                if "resultado_backtest_grafo_realista" in st.session_state:
+                    st.divider()
+                    st.subheader("🔍 Versão Realista (com tratamento de eventos societários)")
+                    st.caption(
+                        f"Mesma estratégia, mesmos parâmetros, mas com operações cuja janela de "
+                        f"holding contém um salto de preço > {d['limiar_evento']:.0%} invalidadas "
+                        "antes da seleção (mitigação de desdobramento/grupamento não ajustado)."
+                    )
+                    op_r, res_r, ir_r, capital_inicial_r = st.session_state.resultado_backtest_grafo_realista
+
+                    if res_r.empty:
+                        st.info("Nenhum período simulável na versão realista com esses parâmetros.")
+                    else:
+                        capital_bruto_r = res_r["capital_apos_periodo"].iloc[-1]
+                        darf_r = ir_r["darf_a_pagar"].sum() if not ir_r.empty else 0.0
+                        capital_liquido_r = capital_bruto_r - darf_r
+
+                        rm1, rm2, rm3 = st.columns(3)
+                        rm1.metric("Capital final (antes de IR) — Realista", f"R$ {capital_bruto_r:,.2f}",
+                                   f"{(capital_bruto_r/capital_inicial_r-1)*100:.2f}%")
+                        rm2.metric("DARF total pago — Realista", f"R$ {darf_r:,.2f}")
+                        rm3.metric("Capital final (líquido de IR) — Realista", f"R$ {capital_liquido_r:,.2f}",
+                                   f"{(capital_liquido_r/capital_inicial_r-1)*100:.2f}%")
+
+                        metricas_r = mr.calcular_metricas_risco(
+                            res_r, capital_inicial_r, selic=d.get("selic"), ibovespa=d.get("ibovespa"),
+                            operacoes=op_r,
+                        )
+                        if metricas_r:
+                            rr1, rr2, rr3, rr4 = st.columns(4)
+                            rr1.metric("Sharpe — Realista", metricas_r.get("sharpe", "—"))
+                            rr2.metric("Sortino — Realista", metricas_r.get("sortino", "—"))
+                            rr3.metric("Calmar — Realista", metricas_r.get("calmar", "—"))
+                            rr4.metric("Máximo drawdown — Realista", f"{metricas_r.get('max_drawdown_pct', '—')}%")
+
+                            rr5, rr6, rr7, rr8 = st.columns(4)
+                            rr5.metric("Retorno anualizado — Realista", f"{metricas_r.get('retorno_anualizado_pct', '—')}%")
+                            rr6.metric("Volatilidade anualizada — Realista", f"{metricas_r.get('volatilidade_anualizada_pct', '—')}%")
+                            rr7.metric("Win rate — Realista", f"{metricas_r.get('win_rate_pct', '—')}%")
+                            rr8.metric("Profit factor — Realista", metricas_r.get("profit_factor", "—"))
+
+                            if "retorno_ibovespa_pct" in metricas_r:
+                                rb1, rb2, rb3, rb4 = st.columns(4)
+                                rb1.metric("Retorno Ibovespa (mesmo período)", f"{metricas_r['retorno_ibovespa_pct']}%")
+                                rb2.metric("Beta (vs. Ibovespa) — Realista", metricas_r.get("beta", "—"))
+                                rb3.metric("Retorno esperado (CAPM) — Realista", f"{metricas_r.get('retorno_esperado_capm_pct', '—')}%")
+                                rb4.metric("Alfa de Jensen (a.a.) — Realista", f"{metricas_r.get('alfa_jensen_pct_aa', '—')}%")
+
+                        # ── Gráfico de capital (Realista) com SELIC/Ibovespa ──
+                        st.markdown("##### Evolução do capital — Realista (vs. SELIC e Ibovespa)")
+                        _rr = res_r.copy()
+                        _rr["data_decisao"] = pd.to_datetime(_rr["data_decisao"])
+                        curva_r = _rr.set_index("data_decisao")[["capital_apos_periodo"]].rename(
+                            columns={"capital_apos_periodo": "Estratégia (Realista)"}
+                        )
+                        _dmin_r, _dmax_r = _rr["data_decisao"].min(), _rr["data_decisao"].max()
+                        if d.get("selic") is not None:
+                            _sc = mr.curva_capital_selic(d["selic"], _dmin_r, _dmax_r, capital_inicial_r)
+                            if not _sc.empty:
+                                curva_r = curva_r.join(_sc.rename("SELIC"), how="outer")
+                        if d.get("ibovespa") is not None:
+                            _ic = mr.curva_capital_ibovespa(d["ibovespa"], _dmin_r, _dmax_r, capital_inicial_r)
+                            if not _ic.empty:
+                                curva_r = curva_r.join(_ic.rename("Ibovespa"), how="outer")
+                        curva_r = curva_r.sort_index().ffill().fillna(capital_inicial_r)
+                        curva_r_norm = (curva_r / capital_inicial_r) * 100
+
+                        if viz_avancada:
+                            dd_r = mr.serie_drawdown(res_r, capital_inicial_r) * 100
+                            dd_r = dd_r.groupby(dd_r.index).last()
+                            fig_r = make_subplots(
+                                rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+                                row_heights=[0.7, 0.3],
+                                subplot_titles=("Capital Realista (Base 100, Log)", "Drawdown Realista (%)"),
+                            )
+                            for col in curva_r_norm.columns:
+                                fig_r.add_trace(go.Scatter(
+                                    x=curva_r_norm.index, y=curva_r_norm[col], name=col, mode="lines"
+                                ), row=1, col=1)
+                            fig_r.add_trace(go.Scatter(
+                                x=dd_r.index, y=dd_r.values, name="Drawdown",
+                                fill="tozeroy", line=dict(color="crimson", width=1),
+                                fillcolor="rgba(220,20,60,0.3)", showlegend=False,
+                            ), row=2, col=1)
+                            fig_r.update_yaxes(type="log", title_text="Base 100 (log)", row=1, col=1)
+                            fig_r.update_yaxes(title_text="DD %", row=2, col=1)
+                            fig_r.update_layout(
+                                template="plotly_dark", height=650, hovermode="x unified",
+                                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                                margin=dict(l=60, r=30, t=60, b=40),
+                            )
+                            st.plotly_chart(fig_r, use_container_width=True)
+                        else:
+                            st.line_chart(curva_r_norm)
+
+                        st.subheader("Resumo por período — Realista")
+                        st.dataframe(res_r, use_container_width=True)
+                        st.subheader("Operações simuladas — Realista")
+                        st.dataframe(op_r, use_container_width=True)
+                # ═══════════════════════════════════════════════════════════════
+
     else:
         st.caption(
             "Roda as 5 estratégias com os MESMOS parâmetros (capital, custos, impostos, período), "
@@ -656,6 +778,128 @@ if "dados_grafo" in st.session_state:
                 height=50
             )
 
+            # ═══════════════════════════════════════════════════════════════
+            # ── Versão Realista: as mesmas 5 estratégias, base tratada ─────
+            # Seção adicional e independente — não substitui a comparação acima.
+            # ═══════════════════════════════════════════════════════════════
+            st.divider()
+            st.subheader("🔍 Comparação Realista (com tratamento de eventos societários)")
+            st.caption(
+                f"As mesmas 5 estratégias, mesmos parâmetros, rodadas sobre a base com operações "
+                f"contaminadas por salto de preço > {d['limiar_evento']:.0%} invalidadas antes da "
+                "seleção. Compare com a tabela e o gráfico originais acima."
+            )
+            linhas_comparacao_r = []
+            curvas_r = {}
+            detalhes_r = {}
+            barra_r = st.progress(0.0, text="Iniciando (realista)...")
+            for idx_r, (nome_r, fn_r) in enumerate(ESTRATEGIAS.items()):
+                barra_r.progress(idx_r / len(ESTRATEGIAS), text=f"Rodando (realista): {nome_r}")
+                operacoes_rr, resumo_rr = _rodar_estrategia(fn_r, **kwargs_comuns_realista)
+                ir_mensal_rr = ge.calcular_ir_mensal(
+                    operacoes_rr, ir_aliquota=d["ir_aliquota"], isencao_vendas_mensal=d["isencao_mensal"]
+                )
+                if resumo_rr.empty:
+                    linhas_comparacao_r.append({
+                        "Estratégia": nome_r, "Nº operações": 0, "Capital final líquido": d["capital"],
+                        "Retorno (%)": 0.0, "Win rate (%)": None,
+                    })
+                    continue
+                capital_final_rr = resumo_rr["capital_apos_periodo"].iloc[-1]
+                darf_rr = ir_mensal_rr["darf_a_pagar"].sum() if not ir_mensal_rr.empty else 0.0
+                capital_liquido_rr = capital_final_rr - darf_rr
+                metricas_rr = mr.calcular_metricas_risco(
+                    resumo_rr, d["capital"], selic=d.get("selic"), ibovespa=d.get("ibovespa"),
+                    operacoes=operacoes_rr,
+                )
+                linhas_comparacao_r.append({
+                    "Estratégia": nome_r,
+                    "Nº operações": len(operacoes_rr),
+                    "Capital final líquido": round(capital_liquido_rr, 2),
+                    "Retorno (%)": round((capital_liquido_rr / d["capital"] - 1) * 100, 2),
+                    "Win rate (%)": metricas_rr.get("win_rate_pct"),
+                    "Profit factor": metricas_rr.get("profit_factor"),
+                    "Sharpe": metricas_rr.get("sharpe"),
+                    "Sortino": metricas_rr.get("sortino"),
+                    "Calmar": metricas_rr.get("calmar"),
+                    "Máx. drawdown (%)": metricas_rr.get("max_drawdown_pct"),
+                    "Beta vs Ibov": metricas_rr.get("beta"),
+                    "Alfa de Jensen (%a.a.)": metricas_rr.get("alfa_jensen_pct_aa"),
+                })
+                _r_curva_rr = resumo_rr.copy()
+                _r_curva_rr["data_decisao"] = pd.to_datetime(_r_curva_rr["data_decisao"])
+                curvas_r[nome_r] = _r_curva_rr.set_index("data_decisao")["capital_apos_periodo"]
+                detalhes_r[nome_r] = (operacoes_rr, resumo_rr, ir_mensal_rr)
+            barra_r.progress(1.0, text="Concluído (realista).")
+
+            comparativo_r = pd.DataFrame(linhas_comparacao_r).sort_values("Retorno (%)", ascending=False)
+            st.dataframe(comparativo_r, use_container_width=True)
+            if not comparativo_r.empty:
+                melhor_r = comparativo_r.iloc[0]["Estratégia"]
+                st.success(f"Melhor resultado neste período/dados (Realista): **{melhor_r}**")
+
+            if curvas_r:
+                if d.get("selic") is not None or d.get("ibovespa") is not None:
+                    _todas_datas_r = pd.concat([s for s in curvas_r.values()], axis=1)
+                    _dmin_cmp_r = _todas_datas_r.index.min()
+                    _dmax_cmp_r = _todas_datas_r.index.max()
+                    if d.get("selic") is not None:
+                        _s_r = mr.curva_capital_selic(d["selic"], _dmin_cmp_r, _dmax_cmp_r, d["capital"])
+                        if not _s_r.empty:
+                            curvas_r["SELIC"] = _s_r
+                    if d.get("ibovespa") is not None:
+                        _ib_r = mr.curva_capital_ibovespa(d["ibovespa"], _dmin_cmp_r, _dmax_cmp_r, d["capital"])
+                        if not _ib_r.empty:
+                            curvas_r["Ibovespa"] = _ib_r
+
+                st.markdown("##### Evolução do capital por estratégia — Realista (Base 100)")
+                _cap_r = d.get("capital", 100000.0)
+                curvas_df_r = pd.DataFrame(curvas_r)
+                curvas_df_r = curvas_df_r.sort_index().ffill().fillna(_cap_r)
+                curvas_df_r_norm = (curvas_df_r / _cap_r) * 100
+
+                if viz_avancada:
+                    _nomes_estrat_r = [c for c in curvas_df_r.columns if c not in ("SELIC", "Ibovespa")]
+                    dd_dict_r = {}
+                    for _nome_er in _nomes_estrat_r:
+                        if _nome_er in detalhes_r:
+                            _, _res_er, _ = detalhes_r[_nome_er]
+                            _dd_r = mr.serie_drawdown(_res_er, _cap_r) * 100
+                            _dd_r = _dd_r.groupby(_dd_r.index).last()
+                            dd_dict_r[_nome_er] = _dd_r
+                    dd_df_r = pd.DataFrame(dd_dict_r)
+                    if not dd_df_r.empty:
+                        dd_df_r = dd_df_r.sort_index().ffill().fillna(0.0)
+
+                    fig_comp_r = make_subplots(
+                        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+                        row_heights=[0.7, 0.3],
+                        subplot_titles=("Capital Realista (Base 100, Log)", "Drawdown Realista Comparativo (%)"),
+                    )
+                    for col in curvas_df_r_norm.columns:
+                        fig_comp_r.add_trace(go.Scatter(
+                            x=curvas_df_r_norm.index, y=curvas_df_r_norm[col], name=col, mode="lines"
+                        ), row=1, col=1)
+                    if not dd_df_r.empty:
+                        for col in dd_df_r.columns:
+                            fig_comp_r.add_trace(go.Scatter(
+                                x=dd_df_r.index, y=dd_df_r[col], name=f"DD {col[:6]}",
+                                mode="lines", line=dict(width=1),
+                            ), row=2, col=1)
+                    fig_comp_r.update_yaxes(type="log", title_text="Base 100 (log)", row=1, col=1)
+                    fig_comp_r.update_yaxes(title_text="DD %", row=2, col=1)
+                    fig_comp_r.update_layout(
+                        template="plotly_dark", height=750, hovermode="x unified",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                        margin=dict(l=60, r=30, t=60, b=40),
+                    )
+                    st.plotly_chart(fig_comp_r, use_container_width=True)
+                else:
+                    st.line_chart(curvas_df_r_norm)
+
+            st.session_state.comparacao_grafo_realista = detalhes_r
+            # ═══════════════════════════════════════════════════════════════
+
         if "comparacao_grafo" in st.session_state:
             with st.expander("Ver detalhes de cada estratégia (operações e IR)", expanded=True):
                 nome_detalhe = st.selectbox("Estratégia para detalhar", list(st.session_state.comparacao_grafo.keys()))
@@ -664,3 +908,16 @@ if "dados_grafo" in st.session_state:
                 if not ir_mensal.empty:
                     st.dataframe(ir_mensal, use_container_width=True)
                 st.dataframe(operacoes, use_container_width=True)
+
+        if "comparacao_grafo_realista" in st.session_state:
+            with st.expander("Ver detalhes de cada estratégia — Realista (operações e IR)", expanded=False):
+                nome_detalhe_r = st.selectbox(
+                    "Estratégia para detalhar (Realista)",
+                    list(st.session_state.comparacao_grafo_realista.keys()),
+                    key="select_detalhe_realista",
+                )
+                operacoes_dr, resumo_dr, ir_mensal_dr = st.session_state.comparacao_grafo_realista[nome_detalhe_r]
+                st.dataframe(resumo_dr, use_container_width=True)
+                if not ir_mensal_dr.empty:
+                    st.dataframe(ir_mensal_dr, use_container_width=True)
+                st.dataframe(operacoes_dr, use_container_width=True)
