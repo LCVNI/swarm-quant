@@ -197,6 +197,19 @@ if arquivo and st.button("Carregar dados"):
         # ───────────────────────────────────────────────────────────────────
 
         df = ge.construir_features_grafo(df, horizonte=int(horizonte))
+        import diagnostico_artefatos as da
+
+        def marcar_eventos_societarios(df, limiar=0.60, horizonte=5):
+            eventos = da.retornos_extremos(df, limiar)  # já existe no seu código
+            df = df.sort_values(["ticker", "data_pregao"]).copy()
+            df["retorno_futuro_valido"] = True
+            for _, row in eventos.iterrows():
+                datas_ticker = df.loc[df["ticker"] == row["ticker"], "data_pregao"]
+                janela = datas_ticker[datas_ticker < row["data_pregao"]].sort_values().tail(horizonte)
+                mask = (df["ticker"] == row["ticker"]) & (df["data_pregao"].isin(janela))
+                df.loc[mask, "retorno_futuro_valido"] = False
+            df.loc[~df["retorno_futuro_valido"], "retorno_futuro"] = np.nan
+            return df
 
         selic = None
         if arquivo_selic is not None:
