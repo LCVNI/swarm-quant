@@ -11,4 +11,5 @@ venv/
 .env/
 env/
 #ignorar cache
-__pycache__/
+__pycache__/causa_grafico_oculto.md
+CHANGELOG_fase3.md
