@@ -13,6 +13,7 @@ pkgs.mkShell {
       requests
       yfinance
       matplotlib
+      plotly
     ]))
   ];
 
