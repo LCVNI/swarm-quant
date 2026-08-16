@@ -351,11 +351,13 @@ if "dados_grafo" in st.session_state:
 
                 # ── Fase 1: curva de capital com benchmarks ─────────────
                 st.subheader("Evolução do capital")
-                curva_df = resumo.set_index("data_decisao")[["capital_apos_periodo"]].rename(
+                _r = resumo.copy()
+                _r["data_decisao"] = pd.to_datetime(_r["data_decisao"])
+                curva_df = _r.set_index("data_decisao")[["capital_apos_periodo"]].rename(
                     columns={"capital_apos_periodo": "Estratégia"}
                 )
-                _data_min_bt = pd.Timestamp(resumo["data_decisao"].min())
-                _data_max_bt = pd.Timestamp(resumo["data_decisao"].max())
+                _data_min_bt = _r["data_decisao"].min()
+                _data_max_bt = _r["data_decisao"].max()
                 if d.get("selic") is not None:
                     _selic_curva = mr.curva_capital_selic(d["selic"], _data_min_bt, _data_max_bt, capital_inicial)
                     if not _selic_curva.empty:
@@ -364,10 +366,12 @@ if "dados_grafo" in st.session_state:
                     _ibov_curva = mr.curva_capital_ibovespa(d["ibovespa"], _data_min_bt, _data_max_bt, capital_inicial)
                     if not _ibov_curva.empty:
                         curva_df = curva_df.join(_ibov_curva.rename("Ibovespa"), how="outer")
-                # Corrige a ocultação do gráfico ffillando os dias ociosos da estratégia
-                curva_df = curva_df.ffill().fillna(capital_inicial)
                 
-                st.line_chart(curva_df)
+                # Corrige "código de barras": DatetimeIndex ordenado garante que o ffill desça o tempo sem errar o benchmark
+                curva_df = curva_df.sort_index().ffill().fillna(capital_inicial)
+                # Normaliza para base 100 (Melhoria visual para períodos super longos c/ juros compostos)
+                curva_df_norm = (curva_df / capital_inicial) * 100
+                st.line_chart(curva_df_norm)
 
                 # ── Fase 2: gráficos complementares ────────────────────
                 with st.expander("Análise complementar (gráficos)", expanded=True):
@@ -474,7 +478,9 @@ if "dados_grafo" in st.session_state:
                     "Beta vs Ibov": metricas.get("beta"),
                     "Alfa de Jensen (%a.a.)": metricas.get("alfa_jensen_pct_aa"),
                 })
-                curvas[nome] = resumo.set_index("data_decisao")["capital_apos_periodo"]
+                _r_curva = resumo.copy()
+                _r_curva["data_decisao"] = pd.to_datetime(_r_curva["data_decisao"])
+                curvas[nome] = _r_curva.set_index("data_decisao")["capital_apos_periodo"]
                 detalhes[nome] = (operacoes, resumo, ir_mensal)
             barra.progress(1.0, text="Concluído.")
 
@@ -509,10 +515,12 @@ if "dados_grafo" in st.session_state:
                         if not _ib.empty:
                             curvas["Ibovespa"] = _ib
 
-                st.subheader("Evolução do capital por estratégia")
+                st.subheader("Evolução do capital por estratégia (Base 100)")
                 curvas_df = pd.DataFrame(curvas)
-                curvas_df = curvas_df.ffill().fillna(d.get("capital", 100000.0))
-                st.line_chart(curvas_df)
+                # O sort_index é CRÍTICO para misturar datas da estratégia com timestamps diários sem "quebrar" o plot!
+                curvas_df = curvas_df.sort_index().ffill().fillna(d.get("capital", 100000.0))
+                curvas_df_norm = (curvas_df / d.get("capital", 100000.0)) * 100
+                st.line_chart(curvas_df_norm)
 
             st.session_state.comparacao_grafo = detalhes
 
