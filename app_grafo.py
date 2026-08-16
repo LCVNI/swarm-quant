@@ -5,6 +5,8 @@ Depende só de grafo_estrategia.py + streamlit/pandas. Não importa core.py.
 """
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 import grafo_estrategia as ge
@@ -27,7 +29,6 @@ st.markdown("""
     .stNumberInput,
     .stSelectbox,
     .stRadio,
-    .stExpander,
     footer { display: none !important; }
 
     /* Remove margens para maximizar espaço */
@@ -35,7 +36,23 @@ st.markdown("""
 
     /* Gráficos 16:9 */
     div[data-testid="stVegaLiteChart"] { width: 100% !important; aspect-ratio: 16/9; }
+
+    /* Protege gráficos, tabelas e métricas contra corte entre páginas */
+    div[data-testid="stVegaLiteChart"],
+    div[data-testid="stDataFrame"],
+    div[data-testid="stMetric"],
+    div[data-testid="stExpander"] {
+        page-break-inside: avoid !important;
+        break-inside: avoid !important;
+    }
+
+    /* Visibilidade condicional: oculta interativo, mostra estático */
+    .screen-only { display: none !important; }
+    .print-only  { display: block !important; }
 }
+
+/* Fora do print: mostra interativo, oculta estático */
+.print-only { display: none; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -254,6 +271,8 @@ if "dados_grafo" in st.session_state:
         return nome_fn(**{k: v for k, v in kwargs.items() if k in aceitos})
 
     modo = st.radio("Modo", ["Rodar uma estratégia", "Comparar as 5 estratégias"], horizontal=True)
+    viz_avancada = st.toggle("📊 Visualização Institucional (Log-scale, Drawdown, Facetas)", value=False,
+                              help="Liga gráficos Plotly com eixo logarítmico, subplot de drawdown, facetamento por estratégia e resampling semanal. Desligado = gráfico simples original.")
 
     kwargs_comuns = dict(
         df_features=df, capital_total=d["capital"], capital_max_por_acao=d["capital_max_por_acao"],
@@ -336,11 +355,13 @@ if "dados_grafo" in st.session_state:
 
                 # ── Fase 1: curva de capital com benchmarks ─────────────
                 st.subheader("Evolução do capital")
-                curva_df = resumo.set_index("data_decisao")[["capital_apos_periodo"]].rename(
+                _r = resumo.copy()
+                _r["data_decisao"] = pd.to_datetime(_r["data_decisao"])
+                curva_df = _r.set_index("data_decisao")[["capital_apos_periodo"]].rename(
                     columns={"capital_apos_periodo": "Estratégia"}
                 )
-                _data_min_bt = pd.Timestamp(resumo["data_decisao"].min())
-                _data_max_bt = pd.Timestamp(resumo["data_decisao"].max())
+                _data_min_bt = _r["data_decisao"].min()
+                _data_max_bt = _r["data_decisao"].max()
                 if d.get("selic") is not None:
                     _selic_curva = mr.curva_capital_selic(d["selic"], _data_min_bt, _data_max_bt, capital_inicial)
                     if not _selic_curva.empty:
@@ -349,10 +370,47 @@ if "dados_grafo" in st.session_state:
                     _ibov_curva = mr.curva_capital_ibovespa(d["ibovespa"], _data_min_bt, _data_max_bt, capital_inicial)
                     if not _ibov_curva.empty:
                         curva_df = curva_df.join(_ibov_curva.rename("Ibovespa"), how="outer")
-                st.line_chart(curva_df)
+                
+                # Corrige "código de barras": DatetimeIndex ordenado garante que o ffill desça o tempo sem errar o benchmark
+                curva_df = curva_df.sort_index().ffill().fillna(capital_inicial)
+                # Normaliza para base 100
+                curva_df_norm = (curva_df / capital_inicial) * 100
+
+                if viz_avancada:
+                    # ── Item E: Resampling semanal (só visual) ──
+                    curva_plot = curva_df_norm.resample('W').last().dropna(how='all')
+                    # ── Item B+C: Plotly com log-scale + subplot de drawdown ──
+                    dd_series = mr.serie_drawdown(resumo, capital_inicial) * 100  # em %
+                    dd_series = dd_series.groupby(dd_series.index).last()  # remove datas duplicadas
+                    dd_plot = dd_series.resample('W').last().dropna()
+                    fig = make_subplots(
+                        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+                        row_heights=[0.7, 0.3],
+                        subplot_titles=("Capital (Base 100, Log)", "Drawdown (%)")
+                    )
+                    for col in curva_plot.columns:
+                        fig.add_trace(go.Scatter(
+                            x=curva_plot.index, y=curva_plot[col], name=col, mode="lines"
+                        ), row=1, col=1)
+                    fig.add_trace(go.Scatter(
+                        x=dd_plot.index, y=dd_plot.values, name="Drawdown",
+                        fill="tozeroy", line=dict(color="crimson", width=1),
+                        fillcolor="rgba(220,20,60,0.3)", showlegend=False,
+                    ), row=2, col=1)
+                    fig.update_yaxes(type="log", title_text="Base 100 (log)", row=1, col=1)
+                    fig.update_yaxes(title_text="DD %", row=2, col=1)
+                    fig.update_xaxes(title_text="Data", row=2, col=1)
+                    fig.update_layout(
+                        template="plotly_dark", height=700, hovermode="x unified",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                        margin=dict(l=60, r=30, t=60, b=40),
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.line_chart(curva_df_norm)
 
                 # ── Fase 2: gráficos complementares ────────────────────
-                with st.expander("Análise complementar (gráficos)", expanded=False):
+                with st.expander("Análise complementar (gráficos)", expanded=True):
                     # DARF mensal
                     if not ir_mensal.empty:
                         st.markdown("##### DARF mensal (R$)")
@@ -404,11 +462,14 @@ if "dados_grafo" in st.session_state:
 
                 # ── Fase 4: botão PDF ──────────────────────────────────
                 st.markdown("---")
-                st.markdown(
-                    '<button onclick="window.print()" style="padding:10px 24px;font-size:16px;'
-                    'background:#1f77b4;color:white;border:none;border-radius:6px;cursor:pointer">'
-                    '📄 Gerar PDF do Relatório (via Navegador)</button>',
-                    unsafe_allow_html=True,
+                import streamlit.components.v1 as components
+                components.html(
+                    """
+                    <button onclick="window.parent.print()" style="padding:10px 24px;font-size:16px;background:#1f77b4;color:white;border:none;border-radius:6px;cursor:pointer;width:100%;">
+                    📄 Gerar PDF do Relatório (via Navegador)
+                    </button>
+                    """,
+                    height=50
                 )
 
     else:
@@ -453,7 +514,9 @@ if "dados_grafo" in st.session_state:
                     "Beta vs Ibov": metricas.get("beta"),
                     "Alfa de Jensen (%a.a.)": metricas.get("alfa_jensen_pct_aa"),
                 })
-                curvas[nome] = resumo.set_index("data_decisao")["capital_apos_periodo"]
+                _r_curva = resumo.copy()
+                _r_curva["data_decisao"] = pd.to_datetime(_r_curva["data_decisao"])
+                curvas[nome] = _r_curva.set_index("data_decisao")["capital_apos_periodo"]
                 detalhes[nome] = (operacoes, resumo, ir_mensal)
             barra.progress(1.0, text="Concluído.")
 
@@ -488,24 +551,103 @@ if "dados_grafo" in st.session_state:
                         if not _ib.empty:
                             curvas["Ibovespa"] = _ib
 
-                st.subheader("Evolução do capital por estratégia")
-                st.line_chart(pd.DataFrame(curvas))
+                st.subheader("Evolução do capital por estratégia (Base 100)")
+                _cap = d.get("capital", 100000.0)
+                curvas_df = pd.DataFrame(curvas)
+                curvas_df = curvas_df.sort_index().ffill().fillna(_cap)
+                curvas_df_norm = (curvas_df / _cap) * 100
+
+                if viz_avancada:
+                    # ── Item E: Resampling semanal ──
+                    curvas_plot = curvas_df_norm.resample('W').last().dropna(how='all')
+
+                    # ── Item B+C: Plotly consolidado com log-scale + Drawdown comparativo ──
+                    _nomes_estrat = [c for c in curvas_df.columns if c not in ("SELIC", "Ibovespa")]
+                    dd_dict = {}
+                    for _nome_e in _nomes_estrat:
+                        if _nome_e in detalhes:
+                            _, _res_e, _ = detalhes[_nome_e]
+                            _dd = mr.serie_drawdown(_res_e, _cap) * 100
+                            _dd = _dd.groupby(_dd.index).last()  # remove datas duplicadas
+                            dd_dict[_nome_e] = _dd
+                    dd_df = pd.DataFrame(dd_dict)
+                    if not dd_df.empty:
+                        dd_df = dd_df.sort_index().ffill().fillna(0.0)
+                        dd_plot = dd_df.resample('W').last().dropna(how='all')
+                    else:
+                        dd_plot = pd.DataFrame()
+
+                    fig_comp = make_subplots(
+                        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+                        row_heights=[0.7, 0.3],
+                        subplot_titles=("Capital (Base 100, Log)", "Drawdown Comparativo (%)")
+                    )
+                    for col in curvas_plot.columns:
+                        fig_comp.add_trace(go.Scatter(
+                            x=curvas_plot.index, y=curvas_plot[col], name=col, mode="lines"
+                        ), row=1, col=1)
+                    if not dd_plot.empty:
+                        for col in dd_plot.columns:
+                            fig_comp.add_trace(go.Scatter(
+                                x=dd_plot.index, y=dd_plot[col], name=f"DD {col[:6]}",
+                                mode="lines", line=dict(width=1),
+                            ), row=2, col=1)
+                    fig_comp.update_yaxes(type="log", title_text="Base 100 (log)", row=1, col=1)
+                    fig_comp.update_yaxes(title_text="DD %", row=2, col=1)
+                    fig_comp.update_xaxes(title_text="Data", row=2, col=1)
+                    fig_comp.update_layout(
+                        template="plotly_dark", height=750, hovermode="x unified",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                        margin=dict(l=60, r=30, t=60, b=40),
+                    )
+                    st.plotly_chart(fig_comp, use_container_width=True)
+
+                    # ── Item D: Facetamento (Small Multiples) ──
+                    st.subheader("Visão individual: Estratégia vs Benchmarks")
+                    _benchmarks = [c for c in curvas_plot.columns if c in ("SELIC", "Ibovespa")]
+                    tabs = st.tabs([n[:25] for n in _nomes_estrat])
+                    for tab, nome_e in zip(tabs, _nomes_estrat):
+                        with tab:
+                            fig_facet = go.Figure()
+                            if nome_e in curvas_plot.columns:
+                                fig_facet.add_trace(go.Scatter(
+                                    x=curvas_plot.index, y=curvas_plot[nome_e],
+                                    name=nome_e, mode="lines", line=dict(width=2.5)
+                                ))
+                            for bm in _benchmarks:
+                                fig_facet.add_trace(go.Scatter(
+                                    x=curvas_plot.index, y=curvas_plot[bm],
+                                    name=bm, mode="lines", line=dict(width=1.5, dash="dot")
+                                ))
+                            fig_facet.update_yaxes(type="log", title_text="Base 100 (log)")
+                            fig_facet.update_layout(
+                                template="plotly_dark", height=400, hovermode="x unified",
+                                title=nome_e,
+                                margin=dict(l=50, r=20, t=50, b=30),
+                            )
+                            st.plotly_chart(fig_facet, use_container_width=True)
+                else:
+                    st.line_chart(curvas_df_norm)
 
             st.session_state.comparacao_grafo = detalhes
 
             # ── Fase 4: botão PDF na comparação ────────────────────
             st.markdown("---")
-            st.markdown(
-                '<button onclick="window.print()" style="padding:10px 24px;font-size:16px;'
-                'background:#1f77b4;color:white;border:none;border-radius:6px;cursor:pointer">'
-                '📄 Gerar PDF do Relatório (via Navegador)</button>',
-                unsafe_allow_html=True,
+            import streamlit.components.v1 as components
+            components.html(
+                """
+                <button onclick="window.parent.print()" style="padding:10px 24px;font-size:16px;background:#1f77b4;color:white;border:none;border-radius:6px;cursor:pointer;width:100%;">
+                📄 Gerar PDF do Relatório (via Navegador)
+                </button>
+                """,
+                height=50
             )
 
         if "comparacao_grafo" in st.session_state:
-            with st.expander("Ver detalhes de cada estratégia (operações e IR)"):
+            with st.expander("Ver detalhes de cada estratégia (operações e IR)", expanded=True):
                 nome_detalhe = st.selectbox("Estratégia para detalhar", list(st.session_state.comparacao_grafo.keys()))
                 operacoes, resumo, ir_mensal = st.session_state.comparacao_grafo[nome_detalhe]
                 st.dataframe(resumo, use_container_width=True)
-                st.dataframe(ir_mensal, use_container_width=True) if not ir_mensal.empty else None
+                if not ir_mensal.empty:
+                    st.dataframe(ir_mensal, use_container_width=True)
                 st.dataframe(operacoes, use_container_width=True)
